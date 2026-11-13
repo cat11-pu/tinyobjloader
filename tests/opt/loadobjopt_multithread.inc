@@ -3075,3 +3075,120 @@ void test_stream_loader_zero_texcoord_normal_indices_match_legacy() {
                                      stream_shapes[0].mesh.indices[i]));
   }
 }
+
+// Regression: concave polygon triangulation must preserve area (relative
+// error < 1e-4), and a negative-index OBJ must resolve to exactly the same
+// triangle indices as its positive-index twin. Covers legacy LoadObj,
+// LoadObjOpt (1 & 4 threads) and the experimental stream loader.
+static double test_polygon_area(const tinyobj::real_t *vertices,
+                                 const std::vector<tinyobj::index_t> &idx) {
+  double area = 0.0;
+  for (size_t i = 0; i + 2 < idx.size(); i += 3) {
+    const tinyobj::real_t *p0 = &vertices[3 * idx[i].vertex_index];
+    const tinyobj::real_t *p1 = &vertices[3 * idx[i + 1].vertex_index];
+    const tinyobj::real_t *p2 = &vertices[3 * idx[i + 2].vertex_index];
+    area += 0.5 * ((p1[0] - p0[0]) * (p2[1] - p0[1]) -
+                   (p1[1] - p0[1]) * (p2[0] - p0[0]));
+  }
+  return area;
+}
+
+static std::string test_build_concave_obj(bool negative) {
+  // U-shaped concave polygon, shoelace area = 7.
+  const double xy[8][2] = {{0, 0}, {3, 0}, {3, 3}, {2, 3},
+                           {2, 1}, {1, 1}, {1, 3}, {0, 3}};
+  std::ostringstream os;
+  for (int i = 0; i < 8; i++)
+    os << "v " << xy[i][0] << " " << xy[i][1] << " 0.0\n";
+  os << "f";
+  for (int i = 0; i < 8; i++)
+    os << " " << (negative ? i - 8 : i + 1);
+  os << "\n";
+  return os.str();
+}
+
+void test_concave_area_and_negative_index_parity() {
+  const std::string pos_obj = test_build_concave_obj(false);
+  const std::string neg_obj = test_build_concave_obj(true);
+  const double kReferenceArea = 7.0;
+  const double kThreshold = 1e-4;
+
+  auto load_legacy = [](const std::string &text,
+                        tinyobj::attrib_t *attrib,
+                        std::vector<tinyobj::shape_t> *shapes) {
+    std::vector<tinyobj::material_t> materials;
+    std::string warn, err;
+    std::istringstream ss(text);
+    bool ok = tinyobj::LoadObj(attrib, shapes, &materials, &warn, &err, &ss);
+    TEST_CHECK(ok == true);
+    return ok;
+  };
+
+  tinyobj::attrib_t pos_legacy, neg_legacy;
+  std::vector<tinyobj::shape_t> pos_ls, neg_ls;
+  load_legacy(pos_obj, &pos_legacy, &pos_ls);
+  load_legacy(neg_obj, &neg_legacy, &neg_ls);
+  TEST_CHECK(pos_ls.size() == 1 && neg_ls.size() == 1);
+  TEST_CHECK(pos_ls[0].mesh.indices.size() == neg_ls[0].mesh.indices.size());
+  for (size_t i = 0; i < pos_ls[0].mesh.indices.size(); i++) {
+    TEST_CHECK(opt_test::IndexEquals(pos_ls[0].mesh.indices[i],
+                                     neg_ls[0].mesh.indices[i]));
+  }
+  const double legacy_area =
+      test_polygon_area(neg_legacy.vertices.data(), neg_ls[0].mesh.indices);
+  TEST_CHECK(std::fabs(std::fabs(legacy_area) - kReferenceArea) /
+                     kReferenceArea <
+                 kThreshold);
+
+  for (int threads : {1, 4}) {
+    tinyobj::basic_attrib_t<> pos_attrib, neg_attrib;
+    std::vector<tinyobj::basic_shape_t<>> pos_shapes, neg_shapes;
+    std::vector<tinyobj::material_t> materials;
+    std::string warn, err;
+    tinyobj::OptLoadConfig config;
+    config.num_threads = threads;
+    config.triangulate = true;
+
+    TEST_CHECK(tinyobj::LoadObjOpt(&pos_attrib, &pos_shapes, &materials,
+                                   &warn, &err, pos_obj.c_str(),
+                                   pos_obj.size(), config) == true);
+    TEST_CHECK(tinyobj::LoadObjOpt(&neg_attrib, &neg_shapes, &materials,
+                                   &warn, &err, neg_obj.c_str(),
+                                   neg_obj.size(), config) == true);
+    TEST_CHECK(pos_attrib.indices.size() == neg_attrib.indices.size());
+    for (size_t i = 0; i < pos_attrib.indices.size(); i++) {
+      TEST_CHECK(opt_test::IndexEquals(pos_attrib.indices[i],
+                                       neg_attrib.indices[i]));
+    }
+    const double area =
+        test_polygon_area(neg_attrib.vertices.data(), neg_attrib.indices);
+    TEST_CHECK(std::fabs(std::fabs(area) - kReferenceArea) /
+                       kReferenceArea <
+                   kThreshold);
+  }
+
+  // Stream loader parity and area accuracy.
+  tinyobj::attrib_t stream_attrib;
+  std::vector<tinyobj::shape_t> stream_shapes;
+  std::vector<tinyobj::material_t> stream_materials;
+  std::string stream_warn, stream_err;
+  std::istringstream stream_in(neg_obj);
+  tinyobj::experimental_stream::StreamLoadConfig stream_config;
+  stream_config.triangulate = true;
+  TEST_CHECK(tinyobj::experimental_stream::LoadObjStreamExperimental(
+                 &stream_attrib, &stream_shapes, &stream_materials,
+                 &stream_warn, &stream_err, &stream_in, NULL,
+                 stream_config) == true);
+  TEST_CHECK(stream_shapes.size() == 1);
+  TEST_CHECK(stream_shapes[0].mesh.indices.size() ==
+             neg_ls[0].mesh.indices.size());
+  for (size_t i = 0; i < neg_ls[0].mesh.indices.size(); i++) {
+    TEST_CHECK(opt_test::IndexEquals(neg_ls[0].mesh.indices[i],
+                                     stream_shapes[0].mesh.indices[i]));
+  }
+  const double stream_area = test_polygon_area(
+      stream_attrib.vertices.data(), stream_shapes[0].mesh.indices);
+  TEST_CHECK(std::fabs(std::fabs(stream_area) - kReferenceArea) /
+                     kReferenceArea <
+                 kThreshold);
+}

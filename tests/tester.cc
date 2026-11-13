@@ -4355,6 +4355,8 @@ TEST_LIST = {
      test_loadobjopt_concave_polygon_matches_legacy},
     {"test_stream_loader_concave_polygon_matches_legacy",
      test_stream_loader_concave_polygon_matches_legacy},
+    {"test_concave_area_and_negative_index_parity",
+     test_concave_area_and_negative_index_parity},
     {"test_loadobjopt_invalid_polygon_matches_legacy",
      test_loadobjopt_invalid_polygon_matches_legacy},
     {"test_stream_loader_hash_in_names",

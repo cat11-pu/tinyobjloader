@@ -7623,6 +7623,179 @@ inline TinyObjPoint cross(const TinyObjPoint &v1, const TinyObjPoint &v2) {
                       v1.x * v2.y - v1.y * v2.x);
 }
 
+// Robust ear clipping for a single polygon ring.
+//
+// The legacy built-in triangulator used an orientation test built from
+// absolute (translation-dependent) coordinates together with a bounded search
+// loop, which dropped triangles on concave polygons and produced area errors
+// far above 1e-4. This projects the ring onto the plane perpendicular to its
+// Newell normal, then runs a terminating ear-clip loop (with a force-clip
+// backstop) so exactly n-2 triangles are always emitted. Output indices are
+// ring-local (0..n-1); the caller maps them back to per-corner attributes.
+static inline double legacy_orient2d(double ax, double ay, double bx,
+                                     double by, double cx, double cy) {
+  return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+static inline bool legacy_point_in_tri(double px, double py, double ax,
+                                       double ay, double bx, double by,
+                                       double cx, double cy, double wind,
+                                       double eps) {
+  return wind * legacy_orient2d(ax, ay, bx, by, px, py) > eps &&
+         wind * legacy_orient2d(bx, by, cx, cy, px, py) > eps &&
+         wind * legacy_orient2d(cx, cy, ax, ay, px, py) > eps;
+}
+
+static inline void legacy_ear_clip_ring(
+    const std::vector<real_t> &vertices,
+    const std::vector<vertex_index_t> &face, std::vector<uint32_t> *out) {
+  const size_t n = face.size();
+  out->resize(3 * (n - 2));
+  if (n == 3) {
+    (*out)[0] = 0;
+    (*out)[1] = 1;
+    (*out)[2] = 2;
+    return;
+  }
+
+  // Newell normal.
+  double nx = 0.0, ny = 0.0, nz = 0.0;
+  for (size_t k = 0; k < n; k++) {
+    const size_t j = (k + 1) % n;
+    const real_t *a = &vertices[3 * static_cast<size_t>(face[k].v_idx)];
+    const real_t *b = &vertices[3 * static_cast<size_t>(face[j].v_idx)];
+    nx += (static_cast<double>(a[1]) - b[1]) *
+          (static_cast<double>(a[2]) + b[2]);
+    ny += (static_cast<double>(a[2]) - b[2]) *
+          (static_cast<double>(a[0]) + b[0]);
+    nz += (static_cast<double>(a[0]) - b[0]) *
+          (static_cast<double>(a[1]) + b[1]);
+  }
+
+  size_t axis0 = 0, axis1 = 1;
+  if (std::fabs(nx) >= std::fabs(ny) && std::fabs(nx) >= std::fabs(nz)) {
+    axis0 = 1;
+    axis1 = 2;
+  } else if (std::fabs(ny) >= std::fabs(nz)) {
+    axis0 = 0;
+    axis1 = 2;
+  }
+
+  std::vector<double> px(n), py(n);
+  double scale = 0.0;
+  for (size_t k = 0; k < n; k++) {
+    const real_t *p = &vertices[3 * static_cast<size_t>(face[k].v_idx)];
+    px[k] = static_cast<double>(p[axis0]);
+    py[k] = static_cast<double>(p[axis1]);
+    if (std::fabs(px[k]) > scale) scale = std::fabs(px[k]);
+    if (std::fabs(py[k]) > scale) scale = std::fabs(py[k]);
+  }
+
+  std::vector<uint32_t> nxt(n), prv(n);
+  std::vector<unsigned char> reflex(n, 0);
+  for (size_t i = 0; i < n; i++) {
+    nxt[i] = static_cast<uint32_t>((i + 1) % n);
+    prv[i] = static_cast<uint32_t>((i + n - 1) % n);
+  }
+
+  double signed_area = 0.0;
+  for (size_t i = 0; i < n; i++) {
+    const size_t j = (i + 1) % n;
+    signed_area += px[i] * py[j] - px[j] * py[i];
+  }
+  const double wind = signed_area < 0.0 ? -1.0 : 1.0;
+  const double eps = scale * scale * 1e-12;
+
+  for (size_t i = 0; i < n; i++) {
+    const double o =
+        wind * legacy_orient2d(px[prv[i]], py[prv[i]], px[i], py[i],
+                               px[nxt[i]], py[nxt[i]]);
+    reflex[i] = (o < -eps) ? 1u : 0u;
+  }
+
+  size_t out_count = 0;
+  size_t remaining = n;
+  size_t cur = 0;
+  size_t guard = 0;
+  int relax = 0;
+  while (remaining > 3) {
+    const size_t prev = prv[cur];
+    const size_t next = nxt[cur];
+    const double raw =
+        legacy_orient2d(px[prev], py[prev], px[cur], py[cur], px[next],
+                        py[next]);
+    const double o = wind * raw;
+    const double scaled_eps =
+        eps * (relax == 0 ? 1.0 : (relax == 1 ? 1e3 : 1e12));
+
+    bool clip = false;
+    if (std::fabs(raw) <= scaled_eps) {
+      clip = true;
+    } else if (o > scaled_eps) {
+      bool blocked = false;
+      size_t r = nxt[next];
+      while (r != prev) {
+        if (reflex[r] &&
+            legacy_point_in_tri(px[r], py[r], px[prev], py[prev],
+                                px[cur], py[cur], px[next], py[next],
+                                wind, scaled_eps)) {
+          blocked = true;
+          break;
+        }
+        r = nxt[r];
+      }
+      if (!blocked) clip = true;
+    }
+
+    if (clip) {
+      (*out)[out_count * 3 + 0] = static_cast<uint32_t>(prev);
+      (*out)[out_count * 3 + 1] = static_cast<uint32_t>(cur);
+      (*out)[out_count * 3 + 2] = static_cast<uint32_t>(next);
+      out_count++;
+      nxt[prev] = static_cast<uint32_t>(next);
+      prv[next] = static_cast<uint32_t>(prev);
+      remaining--;
+      for (size_t affected = 0; affected < 2; affected++) {
+        const size_t v = affected == 0 ? prev : next;
+        const double oo =
+            wind * legacy_orient2d(px[prv[v]], py[prv[v]], px[v], py[v],
+                                   px[nxt[v]], py[nxt[v]]);
+        reflex[v] = (oo < -eps) ? 1u : 0u;
+      }
+      cur = next;
+      guard = 0;
+      relax = 0;
+      continue;
+    }
+
+    cur = next;
+    if (++guard > remaining) {
+      if (relax < 2) {
+        relax++;
+        guard = 0;
+      } else {
+        (*out)[out_count * 3 + 0] = static_cast<uint32_t>(prev);
+        (*out)[out_count * 3 + 1] = static_cast<uint32_t>(cur);
+        (*out)[out_count * 3 + 2] = static_cast<uint32_t>(next);
+        out_count++;
+        nxt[prev] = static_cast<uint32_t>(next);
+        prv[next] = static_cast<uint32_t>(prev);
+        remaining--;
+        cur = next;
+        guard = 0;
+        relax = 0;
+      }
+    }
+  }
+
+  const size_t a = cur;
+  const size_t b = nxt[a];
+  const size_t c = nxt[b];
+  (*out)[out_count * 3 + 0] = static_cast<uint32_t>(a);
+  (*out)[out_count * 3 + 1] = static_cast<uint32_t>(b);
+  (*out)[out_count * 3 + 2] = static_cast<uint32_t>(c);
+}
+
 inline real_t dot(const TinyObjPoint &v1, const TinyObjPoint &v2) {
   return (v1.x * v2.x + v1.y * v2.y + v1.z * v2.z);
 }
@@ -7927,228 +8100,36 @@ static bool exportGroupsToShape(shape_t *shape, const PrimGroup &prim_group,
             }
           }
 
-#else  // Built-in ear clipping triangulation
-          vertex_index_t i0 = face.vertex_indices[0];
-          vertex_index_t i1(-1);
-          vertex_index_t i2 = face.vertex_indices[1];
-
-          // find the two axes to work in
-          size_t axes[2] = {1, 2};
-          for (size_t k = 0; k < npolys; ++k) {
-            i0 = face.vertex_indices[(k + 0) % npolys];
-            i1 = face.vertex_indices[(k + 1) % npolys];
-            i2 = face.vertex_indices[(k + 2) % npolys];
-            size_t vi0 = size_t(i0.v_idx);
-            size_t vi1 = size_t(i1.v_idx);
-            size_t vi2 = size_t(i2.v_idx);
-
-            if (((3 * vi0 + 2) >= v.size()) || ((3 * vi1 + 2) >= v.size()) ||
-                ((3 * vi2 + 2) >= v.size())) {
-              // Invalid triangle.
-              // FIXME(syoyo): Is it ok to simply skip this invalid triangle?
-              continue;
-            }
-            real_t v0x = v[vi0 * 3 + 0];
-            real_t v0y = v[vi0 * 3 + 1];
-            real_t v0z = v[vi0 * 3 + 2];
-            real_t v1x = v[vi1 * 3 + 0];
-            real_t v1y = v[vi1 * 3 + 1];
-            real_t v1z = v[vi1 * 3 + 2];
-            real_t v2x = v[vi2 * 3 + 0];
-            real_t v2y = v[vi2 * 3 + 1];
-            real_t v2z = v[vi2 * 3 + 2];
-            real_t e0x = v1x - v0x;
-            real_t e0y = v1y - v0y;
-            real_t e0z = v1z - v0z;
-            real_t e1x = v2x - v1x;
-            real_t e1y = v2y - v1y;
-            real_t e1z = v2z - v1z;
-            real_t cx = std::fabs(e0y * e1z - e0z * e1y);
-            real_t cy = std::fabs(e0z * e1x - e0x * e1z);
-            real_t cz = std::fabs(e0x * e1y - e0y * e1x);
-            const real_t epsilon = std::numeric_limits<real_t>::epsilon();
-            // std::cout << "cx " << cx << ", cy " << cy << ", cz " << cz <<
-            // "\n";
-            if (cx > epsilon || cy > epsilon || cz > epsilon) {
-              // std::cout << "corner\n";
-              // found a corner
-              if (cx > cy && cx > cz) {
-                // std::cout << "pattern0\n";
-              } else {
-                // std::cout << "axes[0] = 0\n";
-                axes[0] = 0;
-                if (cz > cx && cz > cy) {
-                  // std::cout << "axes[1] = 1\n";
-                  axes[1] = 1;
-                }
-              }
-              break;
-            }
-          }
-
-          face_t remainingFace = face;  // copy
-          size_t guess_vert = 0;
-          vertex_index_t ind[3];
-          real_t vx[3];
-          real_t vy[3];
-
-          // How many iterations can we do without decreasing the remaining
-          // vertices.
-          size_t remainingIterations = face.vertex_indices.size();
-          size_t previousRemainingVertices =
-              remainingFace.vertex_indices.size();
-
-          while (remainingFace.vertex_indices.size() > 3 &&
-                 remainingIterations > 0) {
-            // std::cout << "remainingIterations " << remainingIterations <<
-            // "\n";
-
-            npolys = remainingFace.vertex_indices.size();
-            if (guess_vert >= npolys) {
-              guess_vert -= npolys;
-            }
-
-            if (previousRemainingVertices != npolys) {
-              // The number of remaining vertices decreased. Reset counters.
-              previousRemainingVertices = npolys;
-              remainingIterations = npolys;
-            } else {
-              // We didn't consume a vertex on previous iteration, reduce the
-              // available iterations.
-              remainingIterations--;
-            }
-
-            for (size_t k = 0; k < 3; k++) {
-              ind[k] = remainingFace.vertex_indices[(guess_vert + k) % npolys];
-              size_t vi = size_t(ind[k].v_idx);
-              if (((vi * 3 + axes[0]) >= v.size()) ||
-                  ((vi * 3 + axes[1]) >= v.size())) {
-                // ???
-                vx[k] = static_cast<real_t>(0.0);
-                vy[k] = static_cast<real_t>(0.0);
-              } else {
-                vx[k] = v[vi * 3 + axes[0]];
-                vy[k] = v[vi * 3 + axes[1]];
-              }
-            }
-
-            //
-            // area is calculated per face
-            //
-            real_t e0x = vx[1] - vx[0];
-            real_t e0y = vy[1] - vy[0];
-            real_t e1x = vx[2] - vx[1];
-            real_t e1y = vy[2] - vy[1];
-            real_t cross = e0x * e1y - e0y * e1x;
-            // std::cout << "axes = " << axes[0] << ", " << axes[1] << "\n";
-            // std::cout << "e0x, e0y, e1x, e1y " << e0x << ", " << e0y << ", "
-            // << e1x << ", " << e1y << "\n";
-
-            real_t area =
-                (vx[0] * vy[1] - vy[0] * vx[1]) * static_cast<real_t>(0.5);
-            // std::cout << "cross " << cross << ", area " << area << "\n";
-            // if an internal angle
-            if (cross * area < static_cast<real_t>(0.0)) {
-              // std::cout << "internal \n";
-              guess_vert += 1;
-              // std::cout << "guess vert : " << guess_vert << "\n";
-              continue;
-            }
-
-            // check all other verts in case they are inside this triangle
-            bool overlap = false;
-            for (size_t otherVert = 3; otherVert < npolys; ++otherVert) {
-              size_t idx = (guess_vert + otherVert) % npolys;
-
-              if (idx >= remainingFace.vertex_indices.size()) {
-                // std::cout << "???0\n";
-                // ???
-                continue;
-              }
-
-              size_t ovi = size_t(remainingFace.vertex_indices[idx].v_idx);
-
-              if (((ovi * 3 + axes[0]) >= v.size()) ||
-                  ((ovi * 3 + axes[1]) >= v.size())) {
-                // std::cout << "???1\n";
-                // ???
-                continue;
-              }
-              real_t tx = v[ovi * 3 + axes[0]];
-              real_t ty = v[ovi * 3 + axes[1]];
-              if (pnpoly(3, vx, vy, tx, ty)) {
-                // std::cout << "overlap\n";
-                overlap = true;
-                break;
-              }
-            }
-
-            if (overlap) {
-              // std::cout << "overlap2\n";
-              guess_vert += 1;
-              continue;
-            }
-
-            // this triangle is an ear
-            {
-              index_t idx0, idx1, idx2;
-              idx0.vertex_index = ind[0].v_idx;
-              idx0.normal_index = ind[0].vn_idx;
-              idx0.texcoord_index = ind[0].vt_idx;
-              idx1.vertex_index = ind[1].v_idx;
-              idx1.normal_index = ind[1].vn_idx;
-              idx1.texcoord_index = ind[1].vt_idx;
-              idx2.vertex_index = ind[2].v_idx;
-              idx2.normal_index = ind[2].vn_idx;
-              idx2.texcoord_index = ind[2].vt_idx;
-
-              shape->mesh.indices.push_back(idx0);
-              shape->mesh.indices.push_back(idx1);
-              shape->mesh.indices.push_back(idx2);
-
-              shape->mesh.num_face_vertices.push_back(3);
-              shape->mesh.material_ids.push_back(material_id);
-              shape->mesh.smoothing_group_ids.push_back(
-                  face.smoothing_group_id);
-            }
-
-            // remove v1 from the list
-            size_t removed_vert_index = (guess_vert + 1) % npolys;
-            while (removed_vert_index + 1 < npolys) {
-              remainingFace.vertex_indices[removed_vert_index] =
-                  remainingFace.vertex_indices[removed_vert_index + 1];
-              removed_vert_index += 1;
-            }
-            remainingFace.vertex_indices.pop_back();
-          }
-
-          // std::cout << "remainingFace.vi.size = " <<
-          // remainingFace.vertex_indices.size() << "\n";
-          if (remainingFace.vertex_indices.size() == 3) {
-            i0 = remainingFace.vertex_indices[0];
-            i1 = remainingFace.vertex_indices[1];
-            i2 = remainingFace.vertex_indices[2];
-            {
-              index_t idx0, idx1, idx2;
-              idx0.vertex_index = i0.v_idx;
-              idx0.normal_index = i0.vn_idx;
-              idx0.texcoord_index = i0.vt_idx;
-              idx1.vertex_index = i1.v_idx;
-              idx1.normal_index = i1.vn_idx;
-              idx1.texcoord_index = i1.vt_idx;
-              idx2.vertex_index = i2.v_idx;
-              idx2.normal_index = i2.vn_idx;
-              idx2.texcoord_index = i2.vt_idx;
-
-              shape->mesh.indices.push_back(idx0);
-              shape->mesh.indices.push_back(idx1);
-              shape->mesh.indices.push_back(idx2);
-
-              shape->mesh.num_face_vertices.push_back(3);
-              shape->mesh.material_ids.push_back(material_id);
-              shape->mesh.smoothing_group_ids.push_back(
-                  face.smoothing_group_id);
-            }
+#else  // Robust built-in ear clipping triangulation
+          // Concave-safe, area-preserving triangulation. The old bounded
+          // fan/ear search dropped triangles on reflex polygons; this helper
+          // always emits n-2 triangles via a terminating ear-clip loop.
+          std::vector<uint32_t> ring_tris;
+          legacy_ear_clip_ring(v, face.vertex_indices, &ring_tris);
+          for (size_t t = 0; t < ring_tris.size() / 3; t++) {
+            const vertex_index_t &c0 =
+                face.vertex_indices[ring_tris[3 * t + 0]];
+            const vertex_index_t &c1 =
+                face.vertex_indices[ring_tris[3 * t + 1]];
+            const vertex_index_t &c2 =
+                face.vertex_indices[ring_tris[3 * t + 2]];
+            index_t idx0, idx1, idx2;
+            idx0.vertex_index = c0.v_idx;
+            idx0.normal_index = c0.vn_idx;
+            idx0.texcoord_index = c0.vt_idx;
+            idx1.vertex_index = c1.v_idx;
+            idx1.normal_index = c1.vn_idx;
+            idx1.texcoord_index = c1.vt_idx;
+            idx2.vertex_index = c2.v_idx;
+            idx2.normal_index = c2.vn_idx;
+            idx2.texcoord_index = c2.vt_idx;
+            shape->mesh.indices.push_back(idx0);
+            shape->mesh.indices.push_back(idx1);
+            shape->mesh.indices.push_back(idx2);
+            shape->mesh.num_face_vertices.push_back(3);
+            shape->mesh.material_ids.push_back(material_id);
+            shape->mesh.smoothing_group_ids.push_back(
+                face.smoothing_group_id);
           }
 #endif
         }  // npolys
@@ -10538,6 +10519,209 @@ struct OptSeqEntry {
   uint32_t index;
 };
 
+// ---------------------------------------------------------------------------
+// Robust polygon triangulation (ear clipping).
+//
+// The previous implementation triangulated every n-gon with a plain fan from
+// corner 0 (or an orientation test built from absolute, translation-dependent
+// coordinates). Both produce overlapping/out-of-polygon triangles on concave
+// polygons, silently dropping area. This helper projects the 3D ring onto a
+// plane chosen from its Newell normal and runs a terminating ear-clip loop
+// with a force-clip backstop, so it always emits exactly n-2 triangles and
+// preserves the polygon area for any simple (incl. concave) ring.
+// ---------------------------------------------------------------------------
+
+// Twice the signed 2D triangle area (positive when a->b->c is CCW).
+static inline double opt_orient2d(double ax, double ay, double bx, double by,
+                                  double cx, double cy) {
+  return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+// Strict point-in-triangle test for triangle (a,b,c) wound so that
+// `wind` * area > 0.
+static inline bool opt_point_in_tri(double px, double py, double ax, double ay,
+                                    double bx, double by, double cx, double cy,
+                                    double wind, double eps) {
+  const double d1 = wind * opt_orient2d(ax, ay, bx, by, px, py);
+  const double d2 = wind * opt_orient2d(bx, by, cx, cy, px, py);
+  const double d3 = wind * opt_orient2d(cx, cy, ax, ay, px, py);
+  return d1 > eps && d2 > eps && d3 > eps;
+}
+
+// Triangulate a ring of `n` (>= 3) vertex indices using the 3D positions in
+// `vertices`. Writes 3*(n-2) ring-local indices into `out` and returns the
+// number of emitted triangles (always n-2). Caller guarantees every face
+// vertex index is in range.
+static inline size_t opt_ear_clip_ring(const real_t *vertices,
+                                       const uint32_t *ring, size_t n,
+                                       uint32_t *out) {
+  if (n == 3) {
+    out[0] = 0;
+    out[1] = 1;
+    out[2] = 2;
+    return 1;
+  }
+
+  // Newell normal of the ring.
+  double nx = 0.0, ny = 0.0, nz = 0.0;
+  for (size_t k = 0; k < n; k++) {
+    const size_t j = (k + 1) % n;
+    const real_t *a = &vertices[3 * ring[k]];
+    const real_t *b = &vertices[3 * ring[j]];
+    nx += (static_cast<double>(a[1]) - b[1]) *
+          (static_cast<double>(a[2]) + b[2]);
+    ny += (static_cast<double>(a[2]) - b[2]) *
+          (static_cast<double>(a[0]) + b[0]);
+    nz += (static_cast<double>(a[0]) - b[0]) *
+          (static_cast<double>(a[1]) + b[1]);
+  }
+
+  // Pick the projection plane: keep the two axes perpendicular to the
+  // dominant normal component. Fallback drops the smallest-extent axis.
+  size_t axis0 = 0, axis1 = 1;
+  const double anx = std::fabs(nx), any = std::fabs(ny),
+               anz = std::fabs(nz);
+  if (anx >= any && anx >= anz) {
+    axis0 = 1;
+    axis1 = 2;
+  } else if (any >= anz) {
+    axis0 = 0;
+    axis1 = 2;
+  } else {
+    axis0 = 0;
+    axis1 = 1;
+  }
+
+  std::vector<double> px(n), py(n);
+  double scale = 0.0;
+  for (size_t k = 0; k < n; k++) {
+    const real_t *p = &vertices[3 * ring[k]];
+    px[k] = static_cast<double>(p[axis0]);
+    py[k] = static_cast<double>(p[axis1]);
+    const double mx = std::fabs(px[k]);
+    const double my = std::fabs(py[k]);
+    if (mx > scale) scale = mx;
+    if (my > scale) scale = my;
+  }
+
+  // Doubly linked active ring + reflex flags.
+  std::vector<uint32_t> nxt(n), prv(n);
+  std::vector<unsigned char> reflex(n, 0);
+  for (size_t i = 0; i < n; i++) {
+    nxt[i] = static_cast<uint32_t>((i + 1) % n);
+    prv[i] = static_cast<uint32_t>((i + n - 1) % n);
+  }
+
+  double signed_area = 0.0;
+  for (size_t i = 0; i < n; i++) {
+    const size_t j = (i + 1) % n;
+    signed_area += px[i] * py[j] - px[j] * py[i];
+  }
+  signed_area *= 0.5;
+  const double wind = signed_area < 0.0 ? -1.0 : 1.0;
+  const double eps = scale * scale * 1e-12;
+
+  for (size_t i = 0; i < n; i++) {
+    const size_t p = prv[i], q = nxt[i];
+    const double o =
+        wind * opt_orient2d(px[p], py[p], px[i], py[i], px[q], py[q]);
+    reflex[i] = (o < -eps) ? 1u : 0u;
+  }
+
+  size_t out_count = 0;
+  size_t remaining = n;
+  size_t cur = 0;
+  size_t guard = 0;
+  int relax = 0;  // epsilon escalation level for degenerate input
+
+  while (remaining > 3) {
+    const size_t prev = prv[cur];
+    const size_t next = nxt[cur];
+    const double raw =
+        opt_orient2d(px[prev], py[prev], px[cur], py[cur], px[next],
+                     py[next]);
+    const double o = wind * raw;
+    const double scaled_eps =
+        eps * (relax == 0 ? 1.0 : (relax == 1 ? 1e3 : 1e12));
+
+    bool clip = false;
+    if (std::fabs(raw) <= scaled_eps) {
+      // Collinear / zero-area corner: removable degenerate ear.
+      clip = true;
+    } else if (o > scaled_eps) {
+      // Convex corner: clip only when no reflex active vertex is inside.
+      bool blocked = false;
+      size_t r = nxt[next];
+      while (r != prev) {
+        if (reflex[r] &&
+            opt_point_in_tri(px[r], py[r], px[prev], py[prev], px[cur],
+                             py[cur], px[next], py[next], wind,
+                             scaled_eps)) {
+          blocked = true;
+          break;
+        }
+        r = nxt[r];
+      }
+      if (!blocked) clip = true;
+    }
+
+    if (clip) {
+      out[out_count * 3 + 0] = static_cast<uint32_t>(prev);
+      out[out_count * 3 + 1] = static_cast<uint32_t>(cur);
+      out[out_count * 3 + 2] = static_cast<uint32_t>(next);
+      out_count++;
+      nxt[prev] = static_cast<uint32_t>(next);
+      prv[next] = static_cast<uint32_t>(prev);
+      remaining--;
+
+      // Refresh reflex status of the two neighbors of the removed vertex.
+      for (size_t affected = 0; affected < 2; affected++) {
+        const size_t v = affected == 0 ? prev : next;
+        const size_t pp = prv[v], qq = nxt[v];
+        const double oo =
+            wind * opt_orient2d(px[pp], py[pp], px[v], py[v], px[qq],
+                                py[qq]);
+        reflex[v] = (oo < -eps) ? 1u : 0u;
+      }
+      cur = next;
+      guard = 0;
+      relax = 0;
+      continue;
+    }
+
+    cur = next;
+    if (++guard > remaining) {
+      if (relax < 2) {
+        relax++;
+        guard = 0;
+      } else {
+        // Backstop: force-clip to guarantee termination on pathological
+        // (self-intersecting) input.
+        out[out_count * 3 + 0] = static_cast<uint32_t>(prev);
+        out[out_count * 3 + 1] = static_cast<uint32_t>(cur);
+        out[out_count * 3 + 2] = static_cast<uint32_t>(next);
+        out_count++;
+        nxt[prev] = static_cast<uint32_t>(next);
+        prv[next] = static_cast<uint32_t>(prev);
+        remaining--;
+        cur = next;
+        guard = 0;
+        relax = 0;
+      }
+    }
+  }
+
+  // Final triangle from the three survivors.
+  const size_t a = cur;
+  const size_t b = nxt[a];
+  const size_t c = nxt[b];
+  out[out_count * 3 + 0] = static_cast<uint32_t>(a);
+  out[out_count * 3 + 1] = static_cast<uint32_t>(b);
+  out[out_count * 3 + 2] = static_cast<uint32_t>(c);
+  out_count++;
+  return out_count;
+}
+
 // Per-thread parsed data — replaces vector<OptCommand>
 struct OptThreadData {
   // Vertex positions: 3 floats per vertex, contiguous
@@ -10653,112 +10837,22 @@ static inline size_t opt_triangulate_face(const std::vector<real_t> &vertices,
     return 6;
   }
 
-  std::vector<index_t> remaining(face, face + face_count);
-  size_t axes[2] = {1, 2};
-  for (size_t k = 0; k < face_count; ++k) {
-    const size_t vi0 = static_cast<size_t>(face[(k + 0) % face_count].vertex_index);
-    const size_t vi1 = static_cast<size_t>(face[(k + 1) % face_count].vertex_index);
-    const size_t vi2 = static_cast<size_t>(face[(k + 2) % face_count].vertex_index);
-    const real_t v0x = vertices[vi0 * 3 + 0];
-    const real_t v0y = vertices[vi0 * 3 + 1];
-    const real_t v0z = vertices[vi0 * 3 + 2];
-    const real_t v1x = vertices[vi1 * 3 + 0];
-    const real_t v1y = vertices[vi1 * 3 + 1];
-    const real_t v1z = vertices[vi1 * 3 + 2];
-    const real_t v2x = vertices[vi2 * 3 + 0];
-    const real_t v2y = vertices[vi2 * 3 + 1];
-    const real_t v2z = vertices[vi2 * 3 + 2];
-    const real_t e0x = v1x - v0x;
-    const real_t e0y = v1y - v0y;
-    const real_t e0z = v1z - v0z;
-    const real_t e1x = v2x - v1x;
-    const real_t e1y = v2y - v1y;
-    const real_t e1z = v2z - v1z;
-    const real_t cx = std::fabs(e0y * e1z - e0z * e1y);
-    const real_t cy = std::fabs(e0z * e1x - e0x * e1z);
-    const real_t cz = std::fabs(e0x * e1y - e0y * e1x);
-    const real_t epsilon = std::numeric_limits<real_t>::epsilon();
-    if (cx > epsilon || cy > epsilon || cz > epsilon) {
-      if (!(cx > cy && cx > cz)) {
-        axes[0] = 0;
-        if (cz > cx && cz > cy) {
-          axes[1] = 1;
-        }
-      }
-      break;
-    }
+  // Robust ear clipping (concave-safe, area preserving). See
+  // opt_ear_clip_ring for the algorithm.
+  std::vector<uint32_t> ring(face_count);
+  for (size_t k = 0; k < face_count; k++) {
+    ring[k] = static_cast<uint32_t>(k);
   }
-
-  size_t out = 0;
-  size_t guess_vert = 0;
-  size_t remaining_iterations = remaining.size();
-  size_t previous_remaining_vertices = remaining.size();
-  while (remaining.size() > 3 && remaining_iterations > 0) {
-    const size_t npolys = remaining.size();
-    if (guess_vert >= npolys) {
-      guess_vert -= npolys;
-    }
-
-    if (previous_remaining_vertices != npolys) {
-      previous_remaining_vertices = npolys;
-      remaining_iterations = npolys;
-    } else {
-      remaining_iterations--;
-    }
-
-    index_t ind[3];
-    real_t vx[3];
-    real_t vy[3];
-    for (size_t k = 0; k < 3; k++) {
-      ind[k] = remaining[(guess_vert + k) % npolys];
-      const size_t vi = static_cast<size_t>(ind[k].vertex_index);
-      vx[k] = vertices[vi * 3 + axes[0]];
-      vy[k] = vertices[vi * 3 + axes[1]];
-    }
-
-    const real_t e0x = vx[1] - vx[0];
-    const real_t e0y = vy[1] - vy[0];
-    const real_t e1x = vx[2] - vx[1];
-    const real_t e1y = vy[2] - vy[1];
-    const real_t cross_val = e0x * e1y - e0y * e1x;
-    const real_t area =
-        (vx[0] * vy[1] - vy[0] * vx[1]) * static_cast<real_t>(0.5);
-    if (cross_val * area < static_cast<real_t>(0.0)) {
-      guess_vert += 1;
-      continue;
-    }
-
-    bool overlap = false;
-    for (size_t other_vert = 3; other_vert < npolys; ++other_vert) {
-      const size_t idx = (guess_vert + other_vert) % npolys;
-      const size_t ovi = static_cast<size_t>(remaining[idx].vertex_index);
-      const real_t tx = vertices[ovi * 3 + axes[0]];
-      const real_t ty = vertices[ovi * 3 + axes[1]];
-      if (pnpoly(3, vx, vy, tx, ty)) {
-        overlap = true;
-        break;
-      }
-    }
-
-    if (overlap) {
-      guess_vert += 1;
-      continue;
-    }
-
-    dst[out++] = ind[0];
-    dst[out++] = ind[1];
-    dst[out++] = ind[2];
-    remaining.erase(remaining.begin() +
-                    static_cast<std::ptrdiff_t>((guess_vert + 1) % npolys));
+  std::vector<uint32_t> local(3 * (face_count - 2));
+  const size_t tri_count =
+      opt_ear_clip_ring(vertices.data(), ring.data(), face_count,
+                        local.data());
+  for (size_t t = 0; t < tri_count; t++) {
+    dst[3 * t + 0] = face[local[3 * t + 0]];
+    dst[3 * t + 1] = face[local[3 * t + 1]];
+    dst[3 * t + 2] = face[local[3 * t + 2]];
   }
-
-  if (remaining.size() == 3) {
-    dst[out++] = remaining[0];
-    dst[out++] = remaining[1];
-    dst[out++] = remaining[2];
-  }
-
-  return out;
+  return tri_count * 3;
 }
 
 // Pointer+size overloads for TypedArray-based API
@@ -10809,76 +10903,21 @@ static inline size_t opt_triangulate_face(const real_t *vertices,
   }
 
   // General polygon — ear clipping
-  std::vector<index_t> remaining(face, face + face_count);
-  size_t axes[2] = {1, 2};
-  for (size_t k = 0; k < face_count; ++k) {
-    const size_t vi0 = static_cast<size_t>(face[(k+0)%face_count].vertex_index);
-    const size_t vi1 = static_cast<size_t>(face[(k+1)%face_count].vertex_index);
-    const size_t vi2 = static_cast<size_t>(face[(k+2)%face_count].vertex_index);
-    const real_t e0x = vertices[vi1*3+0]-vertices[vi0*3+0];
-    const real_t e0y = vertices[vi1*3+1]-vertices[vi0*3+1];
-    const real_t e0z = vertices[vi1*3+2]-vertices[vi0*3+2];
-    const real_t e1x = vertices[vi2*3+0]-vertices[vi1*3+0];
-    const real_t e1y = vertices[vi2*3+1]-vertices[vi1*3+1];
-    const real_t e1z = vertices[vi2*3+2]-vertices[vi1*3+2];
-    const real_t cx = std::fabs(e0y*e1z - e0z*e1y);
-    const real_t cy = std::fabs(e0z*e1x - e0x*e1z);
-    const real_t cz = std::fabs(e0x*e1y - e0y*e1x);
-    const real_t epsilon = std::numeric_limits<real_t>::epsilon();
-    if (cx > epsilon || cy > epsilon || cz > epsilon) {
-      if (!(cx > cy && cx > cz)) {
-        axes[0] = 0;
-        if (cz > cx && cz > cy) axes[1] = 1;
-      }
-      break;
-    }
+  // Robust ear clipping (concave-safe, area preserving). See
+  // opt_ear_clip_ring for the algorithm.
+  std::vector<uint32_t> ring(face_count);
+  for (size_t k = 0; k < face_count; k++) {
+    ring[k] = static_cast<uint32_t>(k);
   }
-
-  size_t out = 0;
-  size_t guess_vert = 0;
-  size_t remaining_iterations = remaining.size();
-  size_t previous_remaining_vertices = remaining.size();
-  while (remaining.size() > 3 && remaining_iterations > 0) {
-    const size_t npolys = remaining.size();
-    if (guess_vert >= npolys) guess_vert -= npolys;
-    if (previous_remaining_vertices != npolys) {
-      previous_remaining_vertices = npolys;
-      remaining_iterations = npolys;
-    } else {
-      remaining_iterations--;
-    }
-    index_t ind[3];
-    real_t vx[3], vy[3];
-    for (size_t k = 0; k < 3; k++) {
-      ind[k] = remaining[(guess_vert + k) % npolys];
-      const size_t vi = static_cast<size_t>(ind[k].vertex_index);
-      vx[k] = vertices[vi*3+axes[0]];
-      vy[k] = vertices[vi*3+axes[1]];
-    }
-    const real_t e0x_ = vx[1]-vx[0], e0y_ = vy[1]-vy[0];
-    const real_t e1x_ = vx[2]-vx[1], e1y_ = vy[2]-vy[1];
-    const real_t cross_val = e0x_*e1y_ - e0y_*e1x_;
-    const real_t area = (vx[0]*vy[1] - vy[0]*vx[1]) * static_cast<real_t>(0.5);
-    if (cross_val * area < static_cast<real_t>(0.0)) {
-      guess_vert += 1; continue;
-    }
-    bool overlap = false;
-    for (size_t other_vert = 3; other_vert < npolys; ++other_vert) {
-      const size_t idx = (guess_vert + other_vert) % npolys;
-      const size_t ovi = static_cast<size_t>(remaining[idx].vertex_index);
-      const real_t ptx = vertices[ovi*3+axes[0]];
-      const real_t pty = vertices[ovi*3+axes[1]];
-      if (pnpoly(3, vx, vy, ptx, pty)) { overlap = true; break; }
-    }
-    if (overlap) { guess_vert += 1; continue; }
-    dst[out++] = ind[0]; dst[out++] = ind[1]; dst[out++] = ind[2];
-    remaining.erase(remaining.begin() +
-                    static_cast<std::ptrdiff_t>((guess_vert + 1) % npolys));
+  std::vector<uint32_t> local(3 * (face_count - 2));
+  const size_t tri_count =
+      opt_ear_clip_ring(vertices, ring.data(), face_count, local.data());
+  for (size_t t = 0; t < tri_count; t++) {
+    dst[3 * t + 0] = face[local[3 * t + 0]];
+    dst[3 * t + 1] = face[local[3 * t + 1]];
+    dst[3 * t + 2] = face[local[3 * t + 2]];
   }
-  if (remaining.size() == 3) {
-    dst[out++] = remaining[0]; dst[out++] = remaining[1]; dst[out++] = remaining[2];
-  }
-  return out;
+  return tri_count * 3;
 }
 
 static bool opt_parseLine(OptCommand *command, const char *p, size_t p_len,

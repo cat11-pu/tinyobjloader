@@ -406,10 +406,201 @@ static inline int my_atoi(const char *c) {
 }
 
 // Make index zero-base, and also support relative index.
+// Returns true and writes the zero-based index when `idx` resolves to a valid
+// position in [0,n). Negative indices are relative to the number of vertices
+// already read at that point in the stream (`n`). Zero is invalid per the OBJ
+// spec. Mirrors tinyobj::fixIndex / the C11 loader's tobj_fix_index.
+static inline bool fixIndexChecked(int idx, int n, int *out) {
+  if (idx > 0) {
+    const int r = idx - 1;
+    if (n > 0 && r >= n) return false;
+    *out = r;
+    return true;
+  }
+  if (idx == 0) {
+    *out = -1;  // invalid per spec
+    return false;
+  }
+  const int r = n + idx;  // negative value = relative
+  if (n <= 0 || r < 0 || r >= n) return false;
+  *out = r;
+  return true;
+}
+
+// Backward-compatible unchecked variant used by callers that already
+// validate separately. Prefer fixIndexChecked.
 static inline int fixIndex(int idx, int n) {
-  if (idx > 0) return idx - 1;
-  if (idx == 0) return 0;
-  return n + idx;  // negative value = relative
+  int r;
+  if (!fixIndexChecked(idx, n, &r)) return r;
+  return r;
+}
+
+// ---------------------------------------------------------------------------
+// Concave-safe polygon triangulation (ear clipping).
+//
+// The previous code triangulated every polygon with a fan from corner 0,
+// which overlaps and misses area on concave polygons. This projects the ring
+// onto the plane perpendicular to its Newell normal and runs a terminating
+// ear-clip loop (force-clip backstop), always emitting exactly n-2 triangles.
+// Ring-local indices are written to `out` (cap >= 3*(n-2)).
+// ---------------------------------------------------------------------------
+static inline double opt2_orient(double ax, double ay, double bx, double by,
+                                 double cx, double cy) {
+  return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+static inline void opt2_ear_clip(const float *vertices, size_t n,
+                                 const int *vi, uint32_t *out) {
+  if (n == 3) {
+    out[0] = 0;
+    out[1] = 1;
+    out[2] = 2;
+    return;
+  }
+
+  double nx = 0.0, ny = 0.0, nz = 0.0;
+  for (size_t k = 0; k < n; k++) {
+    const size_t j = (k + 1) % n;
+    const float *a = &vertices[3 * static_cast<size_t>(vi[k])];
+    const float *b = &vertices[3 * static_cast<size_t>(vi[j])];
+    nx += (static_cast<double>(a[1]) - b[1]) *
+          (static_cast<double>(a[2]) + b[2]);
+    ny += (static_cast<double>(a[2]) - b[2]) *
+          (static_cast<double>(a[0]) + b[0]);
+    nz += (static_cast<double>(a[0]) - b[0]) *
+          (static_cast<double>(a[1]) + b[1]);
+  }
+
+  size_t axis0 = 0, axis1 = 1;
+  if (fabs(nx) >= fabs(ny) && fabs(nx) >= fabs(nz)) {
+    axis0 = 1;
+    axis1 = 2;
+  } else if (fabs(ny) >= fabs(nz)) {
+    axis0 = 0;
+    axis1 = 2;
+  }
+
+  std::vector<double> px(n), py(n);
+  double scale = 0.0;
+  for (size_t k = 0; k < n; k++) {
+    const float *p = &vertices[3 * static_cast<size_t>(vi[k])];
+    px[k] = static_cast<double>(p[axis0]);
+    py[k] = static_cast<double>(p[axis1]);
+    if (fabs(px[k]) > scale) scale = fabs(px[k]);
+    if (fabs(py[k]) > scale) scale = fabs(py[k]);
+  }
+
+  std::vector<uint32_t> nxt(n), prv(n);
+  std::vector<unsigned char> reflex(n, 0);
+  for (size_t i = 0; i < n; i++) {
+    nxt[i] = static_cast<uint32_t>((i + 1) % n);
+    prv[i] = static_cast<uint32_t>((i + n - 1) % n);
+  }
+
+  double signed_area = 0.0;
+  for (size_t i = 0; i < n; i++) {
+    const size_t j = (i + 1) % n;
+    signed_area += px[i] * py[j] - px[j] * py[i];
+  }
+  const double wind = signed_area < 0.0 ? -1.0 : 1.0;
+  const double eps = scale * scale * 1e-12;
+
+  for (size_t i = 0; i < n; i++) {
+    const double o =
+        wind * opt2_orient(px[prv[i]], py[prv[i]], px[i], py[i],
+                           px[nxt[i]], py[nxt[i]]);
+    reflex[i] = (o < -eps) ? 1u : 0u;
+  }
+
+  size_t out_count = 0;
+  size_t remaining = n;
+  size_t cur = 0;
+  size_t guard = 0;
+  int relax = 0;
+  while (remaining > 3) {
+    const size_t prev = prv[cur];
+    const size_t next = nxt[cur];
+    const double raw =
+        opt2_orient(px[prev], py[prev], px[cur], py[cur], px[next],
+                    py[next]);
+    const double o = wind * raw;
+    const double scaled_eps =
+        eps * (relax == 0 ? 1.0 : (relax == 1 ? 1e3 : 1e12));
+
+    bool clip = false;
+    if (fabs(raw) <= scaled_eps) {
+      clip = true;
+    } else if (o > scaled_eps) {
+      bool blocked = false;
+      size_t r = nxt[next];
+      while (r != prev) {
+        if (reflex[r]) {
+          const double d1 =
+              wind * opt2_orient(px[prev], py[prev], px[cur], py[cur],
+                                  px[r], py[r]);
+          const double d2 =
+              wind * opt2_orient(px[cur], py[cur], px[next], py[next],
+                                  px[r], py[r]);
+          const double d3 =
+              wind * opt2_orient(px[next], py[next], px[prev], py[prev],
+                                  px[r], py[r]);
+          if (d1 > scaled_eps && d2 > scaled_eps && d3 > scaled_eps) {
+            blocked = true;
+            break;
+          }
+        }
+        r = nxt[r];
+      }
+      if (!blocked) clip = true;
+    }
+
+    if (clip) {
+      out[out_count * 3 + 0] = static_cast<uint32_t>(prev);
+      out[out_count * 3 + 1] = static_cast<uint32_t>(cur);
+      out[out_count * 3 + 2] = static_cast<uint32_t>(next);
+      out_count++;
+      nxt[prev] = static_cast<uint32_t>(next);
+      prv[next] = static_cast<uint32_t>(prev);
+      remaining--;
+      for (size_t affected = 0; affected < 2; affected++) {
+        const size_t v = affected == 0 ? prev : next;
+        const double oo =
+            wind * opt2_orient(px[prv[v]], py[prv[v]], px[v], py[v],
+                                px[nxt[v]], py[nxt[v]]);
+        reflex[v] = (oo < -eps) ? 1u : 0u;
+      }
+      cur = next;
+      guard = 0;
+      relax = 0;
+      continue;
+    }
+
+    cur = next;
+    if (++guard > remaining) {
+      if (relax < 2) {
+        relax++;
+        guard = 0;
+      } else {
+        out[out_count * 3 + 0] = static_cast<uint32_t>(prev);
+        out[out_count * 3 + 1] = static_cast<uint32_t>(cur);
+        out[out_count * 3 + 2] = static_cast<uint32_t>(next);
+        out_count++;
+        nxt[prev] = static_cast<uint32_t>(next);
+        prv[next] = static_cast<uint32_t>(prev);
+        remaining--;
+        cur = next;
+        guard = 0;
+        relax = 0;
+      }
+    }
+  }
+
+  const size_t a = cur;
+  const size_t b = nxt[a];
+  const size_t c = nxt[b];
+  out[out_count * 3 + 0] = static_cast<uint32_t>(a);
+  out[out_count * 3 + 1] = static_cast<uint32_t>(b);
+  out[out_count * 3 + 2] = static_cast<uint32_t>(c);
 }
 
 // Parse raw triples: i, i/j/k, i//k, i/j
@@ -1002,6 +1193,11 @@ typedef struct {
   std::vector<index_t, lfpAlloc::lfpAllocator<index_t> > f;
   // std::vector<index_t> f;
   std::vector<int, lfpAlloc::lfpAllocator<int> > f_num_verts;
+  // Original face corners before triangulation. Empty when triangulation is
+  // disabled (then `f` already holds the raw corners). The merge phase runs
+  // concave-safe ear clipping on these using the resolved vertex positions.
+  std::vector<index_t, lfpAlloc::lfpAllocator<index_t> > raw_face;
+  bool face_needs_tess;
 
   const char *group_name;
   unsigned int group_name_len;
@@ -1133,26 +1329,32 @@ static bool parseLine(Command *command, const char *p, size_t p_len,
     command->type = COMMAND_F;
 
     if (triangulate) {
-      index_t i0 = f[0];
-      index_t i1(-1);
-      index_t i2 = f[1];
-
-      for (size_t k = 2; k < f->size(); k++) {
-        i1 = i2;
-        i2 = f[k];
-        command->f.emplace_back(i0);
-        command->f.emplace_back(i1);
-        command->f.emplace_back(i2);
-
-        command->f_num_verts.emplace_back(3);
+      // Reserve the exact output slot count (n-2 triangles * 3 indices) so
+      // the pre-sized output arrays stay correct. The actual concave-safe
+      // triangulation happens in the merge phase once vertex positions and
+      // fully resolved indices are available.
+      command->raw_face.reserve(f->size());
+      for (size_t k = 0; k < f->size(); k++) {
+        command->raw_face.emplace_back(f[k]);
       }
-
+      command->face_needs_tess = f->size() > 3;
+      if (f->size() == 3) {
+        command->f.emplace_back(f[0]);
+        command->f.emplace_back(f[1]);
+        command->f.emplace_back(f[2]);
+        command->f_num_verts.emplace_back(3);
+      } else {
+        const size_t ntri = f->size() - 2;
+        command->f.resize(ntri * 3);
+        for (size_t k = 0; k < ntri; k++) command->f_num_verts.emplace_back(3);
+      }
     } else {
       for (size_t k = 0; k < f->size(); k++) {
         command->f.emplace_back(f[k]);
       }
 
       command->f_num_verts.emplace_back(f->size());
+      command->face_needs_tess = false;
     }
 
     return true;
@@ -1521,6 +1723,33 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
       face_offsets[t] = face_offsets[t - 1] + command_count[t - 1].num_indices;
     }
 
+    // Populate the position/normal/texcoord arrays in file order BEFORE the
+    // parallel face merge. Polygon triangulation needs the resolved 3D
+    // positions of every referenced vertex, and negative indices resolve
+    // against the running vertex count at the face's position in the stream.
+    {
+      size_t vc = 0, nc = 0, tc = 0;
+      for (size_t t = 0; t < num_threads; t++) {
+        for (size_t i = 0; i < commands[t].size(); i++) {
+          if (commands[t][i].type == COMMAND_V) {
+            attrib->vertices[3 * vc + 0] = commands[t][i].vx;
+            attrib->vertices[3 * vc + 1] = commands[t][i].vy;
+            attrib->vertices[3 * vc + 2] = commands[t][i].vz;
+            vc++;
+          } else if (commands[t][i].type == COMMAND_VN) {
+            attrib->normals[3 * nc + 0] = commands[t][i].nx;
+            attrib->normals[3 * nc + 1] = commands[t][i].ny;
+            attrib->normals[3 * nc + 2] = commands[t][i].nz;
+            nc++;
+          } else if (commands[t][i].type == COMMAND_VT) {
+            attrib->texcoords[2 * tc + 0] = commands[t][i].tx;
+            attrib->texcoords[2 * tc + 1] = commands[t][i].ty;
+            tc++;
+          }
+        }
+      }
+    }
+
     StackVector<std::thread, 16> workers;
 
     for (size_t t = 0; t < num_threads; t++) {
@@ -1587,13 +1816,84 @@ bool parseObj(attrib_t *attrib, std::vector<shape_t> *shapes,
             attrib->texcoords[2 * t_count + 1] = commands[t][i].ty;
             t_count++;
           } else if (commands[t][i].type == COMMAND_F) {
-            for (size_t k = 0; k < commands[t][i].f.size(); k++) {
-              index_t &vi = commands[t][i].f[k];
-              int vertex_index = fixIndex(vi.vertex_index, v_count);
-              int texcoord_index = fixIndex(vi.texcoord_index, t_count);
-              int normal_index = fixIndex(vi.normal_index, n_count);
-              attrib->indices[f_count + k] =
-                  index_t(vertex_index, texcoord_index, normal_index);
+            const bool needs_tess = commands[t][i].face_needs_tess;
+            if (needs_tess) {
+              // Resolve the original corners against the running vertex
+              // counts (negative = relative to vertices already read).
+              const std::vector<index_t, lfpAlloc::lfpAllocator<index_t> >
+                  &raw = commands[t][i].raw_face;
+              std::vector<index_t, lfpAlloc::lfpAllocator<index_t> >
+                  resolved(raw.size());
+              std::vector<int, lfpAlloc::lfpAllocator<int> > resolved_v(
+                  raw.size());
+              bool valid = true;
+              for (size_t k = 0; k < raw.size(); k++) {
+                int vertex_index = -1;
+                int texcoord_index = -1;
+                int normal_index = -1;
+                // Vertex index is mandatory and must resolve in range.
+                if (!fixIndexChecked(raw[k].vertex_index,
+                                     static_cast<int>(v_count),
+                                     &vertex_index)) {
+                  valid = false;
+                  break;
+                }
+                // Optional attributes: the raw parser stores the sentinel
+                // 0x80000000 for a missing slot. Resolve any present index,
+                // including negative (relative) ones.
+                if (raw[k].texcoord_index !=
+                        static_cast<int>(0x80000000) &&
+                    !fixIndexChecked(raw[k].texcoord_index,
+                                     static_cast<int>(t_count),
+                                     &texcoord_index)) {
+                  valid = false;
+                  break;
+                }
+                if (raw[k].normal_index !=
+                        static_cast<int>(0x80000000) &&
+                    !fixIndexChecked(raw[k].normal_index,
+                                     static_cast<int>(n_count),
+                                     &normal_index)) {
+                  valid = false;
+                  break;
+                }
+                resolved[k] =
+                    index_t(vertex_index, texcoord_index, normal_index);
+                resolved_v[k] = vertex_index;
+              }
+              if (valid) {
+                std::vector<uint32_t> local(3 * (raw.size() - 2));
+                opt2_ear_clip(attrib->vertices.data(), raw.size(),
+                              resolved_v.data(), local.data());
+                for (size_t k = 0; k < local.size(); k++) {
+                  attrib->indices[f_count + k] = resolved[local[k]];
+                }
+              } else {
+                // Invalid relative index: emit -1 like the main loaders and
+                // keep the pre-sized slot count intact.
+                for (size_t k = 0; k < commands[t][i].f.size(); k++) {
+                  attrib->indices[f_count + k] = index_t(-1, -1, -1);
+                }
+              }
+            } else {
+              for (size_t k = 0; k < commands[t][i].f.size(); k++) {
+                index_t &vi = commands[t][i].f[k];
+                int vertex_index = -1;
+                int texcoord_index = -1;
+                int normal_index = -1;
+                fixIndexChecked(vi.vertex_index,
+                                static_cast<int>(v_count), &vertex_index);
+                if (vi.texcoord_index != static_cast<int>(0x80000000))
+                  fixIndexChecked(vi.texcoord_index,
+                                  static_cast<int>(t_count),
+                                  &texcoord_index);
+                if (vi.normal_index != static_cast<int>(0x80000000))
+                  fixIndexChecked(vi.normal_index,
+                                  static_cast<int>(n_count),
+                                  &normal_index);
+                attrib->indices[f_count + k] =
+                    index_t(vertex_index, texcoord_index, normal_index);
+              }
             }
             for (size_t k = 0; k < commands[t][i].f_num_verts.size(); k++) {
               attrib->face_num_verts[face_count + k] =

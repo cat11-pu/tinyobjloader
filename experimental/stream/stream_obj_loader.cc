@@ -224,171 +224,186 @@ static bool IsValidFaceVertex(const std::vector<real_t> &vertices,
   return ((3 * vi + 2) < vertices.size());
 }
 
+static double StreamOrient2d(double ax, double ay, double bx, double by,
+                                 double cx, double cy) {
+  return (bx - ax) * (cy - ay) - (by - ay) * (cx - ax);
+}
+
+// Concave-safe ear clipping. The previous bounded fan/ear search dropped
+// triangles on reflex polygons; this projects the ring onto the plane
+// perpendicular to its Newell normal and runs a terminating ear-clip loop
+// (force-clip backstop) emitting exactly n-2 triangles.
+static void StreamEarClipRing(const std::vector<real_t> &vertices,
+                              const index_t *face, size_t n,
+                              std::vector<uint32_t> *out) {
+  out->resize(3 * (n - 2));
+  if (n == 3) {
+    (*out)[0] = 0;
+    (*out)[1] = 1;
+    (*out)[2] = 2;
+    return;
+  }
+
+  double nx = 0.0, ny = 0.0, nz = 0.0;
+  for (size_t k = 0; k < n; k++) {
+    const size_t j = (k + 1) % n;
+    const real_t *a = &vertices[3 * static_cast<size_t>(face[k].vertex_index)];
+    const real_t *b = &vertices[3 * static_cast<size_t>(face[j].vertex_index)];
+    nx += (static_cast<double>(a[1]) - b[1]) *
+          (static_cast<double>(a[2]) + b[2]);
+    ny += (static_cast<double>(a[2]) - b[2]) *
+          (static_cast<double>(a[0]) + b[0]);
+    nz += (static_cast<double>(a[0]) - b[0]) *
+          (static_cast<double>(a[1]) + b[1]);
+  }
+
+  size_t axis0 = 0, axis1 = 1;
+  if (std::fabs(nx) >= std::fabs(ny) && std::fabs(nx) >= std::fabs(nz)) {
+    axis0 = 1;
+    axis1 = 2;
+  } else if (std::fabs(ny) >= std::fabs(nz)) {
+    axis0 = 0;
+    axis1 = 2;
+  }
+
+  std::vector<double> px(n), py(n);
+  double scale = 0.0;
+  for (size_t k = 0; k < n; k++) {
+    const real_t *p =
+        &vertices[3 * static_cast<size_t>(face[k].vertex_index)];
+    px[k] = static_cast<double>(p[axis0]);
+    py[k] = static_cast<double>(p[axis1]);
+    if (std::fabs(px[k]) > scale) scale = std::fabs(px[k]);
+    if (std::fabs(py[k]) > scale) scale = std::fabs(py[k]);
+  }
+
+  std::vector<uint32_t> nxt(n), prv(n);
+  std::vector<unsigned char> reflex(n, 0);
+  for (size_t i = 0; i < n; i++) {
+    nxt[i] = static_cast<uint32_t>((i + 1) % n);
+    prv[i] = static_cast<uint32_t>((i + n - 1) % n);
+  }
+  double signed_area = 0.0;
+  for (size_t i = 0; i < n; i++) {
+    const size_t j = (i + 1) % n;
+    signed_area += px[i] * py[j] - px[j] * py[i];
+  }
+  const double wind = signed_area < 0.0 ? -1.0 : 1.0;
+  const double eps = scale * scale * 1e-12;
+  for (size_t i = 0; i < n; i++) {
+    const double o =
+        wind * StreamOrient2d(px[prv[i]], py[prv[i]], px[i], py[i],
+                              px[nxt[i]], py[nxt[i]]);
+    reflex[i] = (o < -eps) ? 1u : 0u;
+  }
+
+  size_t out_count = 0;
+  size_t remaining = n;
+  size_t cur = 0;
+  size_t guard = 0;
+  int relax = 0;
+  while (remaining > 3) {
+    const size_t prev = prv[cur];
+    const size_t next = nxt[cur];
+    const double raw =
+        StreamOrient2d(px[prev], py[prev], px[cur], py[cur], px[next],
+                       py[next]);
+    const double o = wind * raw;
+    const double scaled_eps =
+        eps * (relax == 0 ? 1.0 : (relax == 1 ? 1e3 : 1e12));
+
+    bool clip = false;
+    if (std::fabs(raw) <= scaled_eps) {
+      clip = true;
+    } else if (o > scaled_eps) {
+      bool blocked = false;
+      size_t r = nxt[next];
+      while (r != prev) {
+        if (reflex[r]) {
+          const double d1 =
+              wind * StreamOrient2d(px[prev], py[prev], px[cur], py[cur],
+                                    px[r], py[r]);
+          const double d2 =
+              wind * StreamOrient2d(px[cur], py[cur], px[next], py[next],
+                                    px[r], py[r]);
+          const double d3 =
+              wind * StreamOrient2d(px[next], py[next], px[prev], py[prev],
+                                    px[r], py[r]);
+          if (d1 > scaled_eps && d2 > scaled_eps && d3 > scaled_eps) {
+            blocked = true;
+            break;
+          }
+        }
+        r = nxt[r];
+      }
+      if (!blocked) clip = true;
+    }
+
+    if (clip) {
+      (*out)[out_count * 3 + 0] = static_cast<uint32_t>(prev);
+      (*out)[out_count * 3 + 1] = static_cast<uint32_t>(cur);
+      (*out)[out_count * 3 + 2] = static_cast<uint32_t>(next);
+      out_count++;
+      nxt[prev] = static_cast<uint32_t>(next);
+      prv[next] = static_cast<uint32_t>(prev);
+      remaining--;
+      for (size_t affected = 0; affected < 2; affected++) {
+        const size_t v = affected == 0 ? prev : next;
+        const double oo =
+            wind * StreamOrient2d(px[prv[v]], py[prv[v]], px[v], py[v],
+                                  px[nxt[v]], py[nxt[v]]);
+        reflex[v] = (oo < -eps) ? 1u : 0u;
+      }
+      cur = next;
+      guard = 0;
+      relax = 0;
+      continue;
+    }
+
+    cur = next;
+    if (++guard > remaining) {
+      if (relax < 2) {
+        relax++;
+        guard = 0;
+      } else {
+        (*out)[out_count * 3 + 0] = static_cast<uint32_t>(prev);
+        (*out)[out_count * 3 + 1] = static_cast<uint32_t>(cur);
+        (*out)[out_count * 3 + 2] = static_cast<uint32_t>(next);
+        out_count++;
+        nxt[prev] = static_cast<uint32_t>(next);
+        prv[next] = static_cast<uint32_t>(prev);
+        remaining--;
+        cur = next;
+        guard = 0;
+        relax = 0;
+      }
+    }
+  }
+  const size_t a = cur;
+  const size_t b = nxt[a];
+  const size_t c = nxt[b];
+  (*out)[out_count * 3 + 0] = static_cast<uint32_t>(a);
+  (*out)[out_count * 3 + 1] = static_cast<uint32_t>(b);
+  (*out)[out_count * 3 + 2] = static_cast<uint32_t>(c);
+}
+
 static size_t TriangulateFaceLikeLegacy(const std::vector<real_t> &vertices,
                                         const index_t *face, size_t face_count,
                                         index_t *dst) {
   if (face_count < 3) return 0;
-  if (face_count == 3) {
-    dst[0] = face[0];
-    dst[1] = face[1];
-    dst[2] = face[2];
-    return 3;
-  }
-
   for (size_t i = 0; i < face_count; i++) {
     if (!IsValidFaceVertex(vertices, face[i])) {
       return 0;
     }
   }
-
-  if (face_count == 4) {
-    const size_t vi0 = static_cast<size_t>(face[0].vertex_index);
-    const size_t vi1 = static_cast<size_t>(face[1].vertex_index);
-    const size_t vi2 = static_cast<size_t>(face[2].vertex_index);
-    const size_t vi3 = static_cast<size_t>(face[3].vertex_index);
-    const real_t v0x = vertices[vi0 * 3 + 0];
-    const real_t v0y = vertices[vi0 * 3 + 1];
-    const real_t v0z = vertices[vi0 * 3 + 2];
-    const real_t v1x = vertices[vi1 * 3 + 0];
-    const real_t v1y = vertices[vi1 * 3 + 1];
-    const real_t v1z = vertices[vi1 * 3 + 2];
-    const real_t v2x = vertices[vi2 * 3 + 0];
-    const real_t v2y = vertices[vi2 * 3 + 1];
-    const real_t v2z = vertices[vi2 * 3 + 2];
-    const real_t v3x = vertices[vi3 * 3 + 0];
-    const real_t v3y = vertices[vi3 * 3 + 1];
-    const real_t v3z = vertices[vi3 * 3 + 2];
-    const real_t e02x = v2x - v0x;
-    const real_t e02y = v2y - v0y;
-    const real_t e02z = v2z - v0z;
-    const real_t e13x = v3x - v1x;
-    const real_t e13y = v3y - v1y;
-    const real_t e13z = v3z - v1z;
-    const real_t sqr02 = e02x * e02x + e02y * e02y + e02z * e02z;
-    const real_t sqr13 = e13x * e13x + e13y * e13y + e13z * e13z;
-    if (sqr02 < sqr13) {
-      dst[0] = face[0];
-      dst[1] = face[1];
-      dst[2] = face[2];
-      dst[3] = face[0];
-      dst[4] = face[2];
-      dst[5] = face[3];
-    } else {
-      dst[0] = face[0];
-      dst[1] = face[1];
-      dst[2] = face[3];
-      dst[3] = face[1];
-      dst[4] = face[2];
-      dst[5] = face[3];
-    }
-    return 6;
+  std::vector<uint32_t> local;
+  StreamEarClipRing(vertices, face, face_count, &local);
+  for (size_t t = 0; t < local.size() / 3; t++) {
+    dst[3 * t + 0] = face[local[3 * t + 0]];
+    dst[3 * t + 1] = face[local[3 * t + 1]];
+    dst[3 * t + 2] = face[local[3 * t + 2]];
   }
-
-  std::vector<index_t> remaining(face, face + face_count);
-  size_t axes[2] = {1, 2};
-  for (size_t k = 0; k < face_count; ++k) {
-    const size_t vi0 = static_cast<size_t>(face[(k + 0) % face_count].vertex_index);
-    const size_t vi1 = static_cast<size_t>(face[(k + 1) % face_count].vertex_index);
-    const size_t vi2 = static_cast<size_t>(face[(k + 2) % face_count].vertex_index);
-    const real_t v0x = vertices[vi0 * 3 + 0];
-    const real_t v0y = vertices[vi0 * 3 + 1];
-    const real_t v0z = vertices[vi0 * 3 + 2];
-    const real_t v1x = vertices[vi1 * 3 + 0];
-    const real_t v1y = vertices[vi1 * 3 + 1];
-    const real_t v1z = vertices[vi1 * 3 + 2];
-    const real_t v2x = vertices[vi2 * 3 + 0];
-    const real_t v2y = vertices[vi2 * 3 + 1];
-    const real_t v2z = vertices[vi2 * 3 + 2];
-    const real_t e0x = v1x - v0x;
-    const real_t e0y = v1y - v0y;
-    const real_t e0z = v1z - v0z;
-    const real_t e1x = v2x - v1x;
-    const real_t e1y = v2y - v1y;
-    const real_t e1z = v2z - v1z;
-    const real_t cx = std::fabs(e0y * e1z - e0z * e1y);
-    const real_t cy = std::fabs(e0z * e1x - e0x * e1z);
-    const real_t cz = std::fabs(e0x * e1y - e0y * e1x);
-    const real_t epsilon = std::numeric_limits<real_t>::epsilon();
-    if (cx > epsilon || cy > epsilon || cz > epsilon) {
-      if (!(cx > cy && cx > cz)) {
-        axes[0] = 0;
-        if (cz > cx && cz > cy) {
-          axes[1] = 1;
-        }
-      }
-      break;
-    }
-  }
-
-  size_t out = 0;
-  size_t guess_vert = 0;
-  size_t remaining_iterations = remaining.size();
-  size_t previous_remaining_vertices = remaining.size();
-  while (remaining.size() > 3 && remaining_iterations > 0) {
-    const size_t npolys = remaining.size();
-    if (guess_vert >= npolys) {
-      guess_vert -= npolys;
-    }
-    if (previous_remaining_vertices != npolys) {
-      previous_remaining_vertices = npolys;
-      remaining_iterations = npolys;
-    } else {
-      remaining_iterations--;
-    }
-
-    index_t ind[3];
-    real_t vx[3];
-    real_t vy[3];
-    for (size_t k = 0; k < 3; k++) {
-      ind[k] = remaining[(guess_vert + k) % npolys];
-      const size_t vi = static_cast<size_t>(ind[k].vertex_index);
-      vx[k] = vertices[vi * 3 + axes[0]];
-      vy[k] = vertices[vi * 3 + axes[1]];
-    }
-
-    const real_t e0x = vx[1] - vx[0];
-    const real_t e0y = vy[1] - vy[0];
-    const real_t e1x = vx[2] - vx[1];
-    const real_t e1y = vy[2] - vy[1];
-    const real_t cross_val = e0x * e1y - e0y * e1x;
-    const real_t area =
-        (vx[0] * vy[1] - vy[0] * vx[1]) * static_cast<real_t>(0.5);
-    if (cross_val * area < static_cast<real_t>(0.0)) {
-      guess_vert += 1;
-      continue;
-    }
-
-    bool overlap = false;
-    for (size_t other_vert = 3; other_vert < npolys; ++other_vert) {
-      const size_t idx = (guess_vert + other_vert) % npolys;
-      const size_t ovi = static_cast<size_t>(remaining[idx].vertex_index);
-      const real_t tx = vertices[ovi * 3 + axes[0]];
-      const real_t ty = vertices[ovi * 3 + axes[1]];
-      if (PointInPolygon(3, vx, vy, tx, ty)) {
-        overlap = true;
-        break;
-      }
-    }
-
-    if (overlap) {
-      guess_vert += 1;
-      continue;
-    }
-
-    dst[out++] = ind[0];
-    dst[out++] = ind[1];
-    dst[out++] = ind[2];
-    remaining.erase(remaining.begin() +
-                    static_cast<std::ptrdiff_t>((guess_vert + 1) % npolys));
-  }
-
-  if (remaining.size() == 3) {
-    dst[out++] = remaining[0];
-    dst[out++] = remaining[1];
-    dst[out++] = remaining[2];
-  }
-
-  return out;
+  return local.size();
 }
 
 static bool ParseRawTripleToken(const std::string &token, RawIndex *out) {
