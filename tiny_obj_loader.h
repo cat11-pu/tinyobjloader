@@ -9987,30 +9987,54 @@ static inline int opt_my_atoi(const char *c) {
   return static_cast<int>(value);
 }
 
-static inline const char *opt_find_index_token_end(const char *token) {
-  const char *end = token;
-  while (*end != '\0' && *end != '/' && *end != ' ' && *end != '\t' &&
-         *end != '\r' && *end != '\n') {
-    end++;
-  }
-  return end;
-}
+// Parse one face index token in a single forward scan.  This replaces the
+// find-end-then-rescan pattern used by opt_parseRawTriple.  `end` bounds the
+// scan; delimiters are left at `*token` for the caller.
+static inline bool opt_parseIndexFast(const char **token, const char *end,
+                                      int *value) {
+  if (!token || !value) return false;
+  const char *p = *token;
+  if (p >= end) return false;
 
-static inline bool opt_tryParseIndexToken(const char *token, const char *end,
-                                          int *value) {
-  if (!value || !token || !end || token >= end) return false;
-
-  const char *cursor = token;
-  if (*cursor == '+' || *cursor == '-') {
-    cursor++;
+  bool negative = false;
+  if (*p == '+' || *p == '-') {
+    negative = (*p == '-');
+    ++p;
   }
-  if (cursor >= end) return false;
-  while (cursor < end) {
-    if (!TINYOBJ_OPT_IS_DIGIT(*cursor)) return false;
-    cursor++;
+  if (p >= end || !TINYOBJ_OPT_IS_DIGIT(*p)) return false;
+
+  const unsigned int limit =
+      negative ? static_cast<unsigned int>(INT_MAX) + 1u
+               : static_cast<unsigned int>(INT_MAX);
+  unsigned int v = 0;
+  bool saturated = false;
+  while (p < end && TINYOBJ_OPT_IS_DIGIT(*p)) {
+    const unsigned int digit = static_cast<unsigned int>(*p - '0');
+    if (!saturated) {
+      if (v > (limit / 10u) ||
+          (v == (limit / 10u) && digit > (limit % 10u))) {
+        saturated = true;
+        v = limit;
+      } else {
+        v = v * 10u + digit;
+      }
+    }
+    ++p;
   }
 
-  *value = opt_my_atoi(token);
+  if (p < end && *p != '/' && *p != ' ' && *p != '\t' && *p != '\r' &&
+      *p != '\n' && *p != '\0') {
+    return false;
+  }
+
+  if (negative) {
+    *value = (v == static_cast<unsigned int>(INT_MAX) + 1u)
+                 ? INT_MIN
+                 : -static_cast<int>(v);
+  } else {
+    *value = static_cast<int>(v);
+  }
+  *token = p;
   return true;
 }
 
@@ -10244,15 +10268,14 @@ struct opt_index_t {
       : vertex_index(vi), texcoord_index(ti), normal_index(ni) {}
 };
 
-static bool opt_parseRawTriple(const char **token, opt_index_t *ret) {
+static bool opt_parseRawTriple(const char **token, const char *line_end,
+                               opt_index_t *ret) {
   if (!token || !ret) return false;
 
   opt_index_t vi;
-  const char *segment_end = opt_find_index_token_end(*token);
-  if (!opt_tryParseIndexToken(*token, segment_end, &vi.vertex_index)) {
+  if (!opt_parseIndexFast(token, line_end, &vi.vertex_index)) {
     return false;
   }
-  *token = segment_end;
   if (**token != '/') {
     *ret = vi;
     return true;
@@ -10261,30 +10284,24 @@ static bool opt_parseRawTriple(const char **token, opt_index_t *ret) {
 
   if (**token == '/') {
     (*token)++;
-    segment_end = opt_find_index_token_end(*token);
-    if (!opt_tryParseIndexToken(*token, segment_end, &vi.normal_index)) {
+    if (!opt_parseIndexFast(token, line_end, &vi.normal_index)) {
       return false;
     }
-    *token = segment_end;
     *ret = vi;
     return true;
   }
 
-  segment_end = opt_find_index_token_end(*token);
-  if (!opt_tryParseIndexToken(*token, segment_end, &vi.texcoord_index)) {
+  if (!opt_parseIndexFast(token, line_end, &vi.texcoord_index)) {
     return false;
   }
-  *token = segment_end;
   if (**token != '/') {
     *ret = vi;
     return true;
   }
   (*token)++;
-  segment_end = opt_find_index_token_end(*token);
-  if (!opt_tryParseIndexToken(*token, segment_end, &vi.normal_index)) {
+  if (!opt_parseIndexFast(token, line_end, &vi.normal_index)) {
     return false;
   }
-  *token = segment_end;
   *ret = vi;
   return true;
 }
@@ -10570,6 +10587,8 @@ struct OptThreadData {
   bool saw_any_weight;
   bool saw_any_texcoord_w;
   bool saw_any_smoothing;
+  bool saw_degenerate;
+  bool saw_nonpositive_index;
 
   // Error tracking
   size_t error_line;
@@ -10579,7 +10598,8 @@ struct OptThreadData {
       : num_v(0), num_vn(0), num_vt(0), num_f_indices(0), num_f_faces(0),
         saw_any_color(false), saw_missing_color(false),
         saw_any_weight(false), saw_any_texcoord_w(false),
-        saw_any_smoothing(false), error_line(0) {}
+        saw_any_smoothing(false), saw_degenerate(false),
+        saw_nonpositive_index(false), error_line(0) {}
 };
 
 static inline bool opt_is_valid_face_vertex(const std::vector<real_t> &vertices,
@@ -11017,7 +11037,7 @@ static bool opt_parseLine(OptCommand *command, const char *p, size_t p_len,
 
     while (!TINYOBJ_OPT_IS_NEW_LINE(token[0]) && !opt_is_comment_start(token)) {
       opt_index_t vi;
-      if (!opt_parseRawTriple(&token, &vi)) {
+      if (!opt_parseRawTriple(&token, p + p_len, &vi)) {
         if (parse_error) *parse_error = true;
         if (parse_error_message) {
           *parse_error_message = "failed to parse `f' line (invalid vertex index)";
@@ -11549,6 +11569,84 @@ class OptFloatCache {
 // Handles nan/inf keywords with OBJ-compatible replacement values (matching
 // opt_tryParseDouble behavior).
 #ifndef TINYOBJLOADER_DISABLE_FAST_FLOAT
+// Parse decimal tokens whose exact binary value is representable in real_t.
+// This covers the overwhelmingly common OBJ coordinates (.5, .25, integers,
+// ...) with integer arithmetic and no locale or temporary string.  Anything
+// else (long mantissas, exponents, inexact decimals) falls back to fast_float,
+// preserving its correctly-rounded result.  `*end` points at the first
+// delimiter on success.
+static inline bool opt_tryParseExactDecimal(const char *p, const char *limit,
+                                            real_t *out, const char **end) {
+  static const uint64_t kPow10[] = {
+      1ULL, 10ULL, 100ULL, 1000ULL, 10000ULL, 100000ULL,
+      1000000ULL, 10000000ULL, 100000000ULL, 1000000000ULL};
+
+  bool negative = false;
+  if (p < limit && (*p == '+' || *p == '-')) {
+    negative = (*p == '-');
+    ++p;
+  }
+  if (p >= limit) return false;
+
+  uint64_t integer = 0;
+  uint64_t fraction = 0;
+  unsigned int int_digits = 0;
+  unsigned int frac_digits = 0;
+  bool saw_digit = false;
+
+  while (p < limit && TINYOBJ_OPT_IS_DIGIT(*p)) {
+    if (int_digits >= 9) return false;
+    integer = integer * 10u + static_cast<unsigned int>(*p - '0');
+    ++int_digits;
+    saw_digit = true;
+    ++p;
+  }
+  if (p < limit && *p == '.') {
+    ++p;
+    while (p < limit && TINYOBJ_OPT_IS_DIGIT(*p)) {
+      if (frac_digits >= 9) return false;
+      fraction = fraction * 10u + static_cast<unsigned int>(*p - '0');
+      ++frac_digits;
+      saw_digit = true;
+      ++p;
+    }
+  }
+  if (!saw_digit) return false;
+  if (p < limit && *p != ' ' && *p != '\t' && *p != '\r' && *p != '\n' &&
+      *p != '#' && *p != '\0') {
+    return false;  // exponent, malformed token, or another suffix
+  }
+
+  uint64_t numerator =
+      integer * kPow10[frac_digits] + fraction;
+  unsigned int denominator_exp = frac_digits;
+
+  // 10^n = 2^n * 5^n.  The value is exactly representable only when the
+  // numerator contains all factors of five; then reduce the remaining powers
+  // of two into the exponent.
+  for (unsigned int i = 0; i < frac_digits; ++i) {
+    if (numerator % 5u != 0) return false;
+    numerator /= 5u;
+  }
+  while (denominator_exp > 0 && (numerator & 1u) == 0) {
+    numerator >>= 1;
+    --denominator_exp;
+  }
+
+  // A float has 24 significant bits and a double 53.  Keeping the reduced
+  // integer within that width makes ldexp() exact.
+  const uint64_t max_significand =
+      static_cast<uint64_t>(1) << std::numeric_limits<real_t>::digits;
+  if (numerator > max_significand) return false;
+
+  double value = std::ldexp(static_cast<double>(numerator),
+                            -static_cast<int>(denominator_exp));
+  if (negative) value = -value;
+  *out = static_cast<real_t>(value);
+  *end = p;
+  return true;
+}
+
 static inline bool opt_fast_parse_float(real_t *out, const char **cursor,
                                         const char *line_end,
                                         OptFloatCache *cache = nullptr) {
@@ -11573,6 +11671,16 @@ static inline bool opt_fast_parse_float(real_t *out, const char **cursor,
           return true;
         }
       }
+    }
+  }
+
+  {
+    const char *decimal_end = p;
+    real_t decimal_value;
+    if (opt_tryParseExactDecimal(p, line_end, &decimal_value, &decimal_end)) {
+      *out = decimal_value;
+      *cursor = decimal_end;
+      return true;
     }
   }
 
@@ -11626,6 +11734,90 @@ static inline bool opt_fast_parse_float(real_t *out, const char **cursor,
   return true;
 }
 #endif
+
+// Parse an `f` line directly into compact per-thread storage.  The previous
+// path built a full OptCommand (including several std::strings and a vector),
+// copied it into OptFaceCmd, and then destroyed it for every face.  Triangles
+// and quads now stay entirely on the stack until their final compact record.
+static void opt_parseFaceLineToThreadData(OptThreadData &td,
+                                          const char *token,
+                                          const char *line_end,
+                                          bool triangulate,
+                                          size_t line_number,
+                                          OptFloatCache *cache) {
+  (void)cache;
+  opt_skip_space(&token);
+
+  opt_index_t face_buf[8];
+  std::vector<opt_index_t> face_overflow;
+  unsigned int face_count = 0;
+
+  while (token < line_end && !TINYOBJ_OPT_IS_NEW_LINE(token[0]) &&
+         token[0] != '#' && token[0] != '\0') {
+    opt_index_t vi;
+    if (!opt_parseRawTriple(&token, line_end, &vi)) {
+      td.error_line = line_number;
+      td.error_message = "failed to parse `f' line (invalid vertex index)";
+      return;
+    }
+    if (vi.vertex_index <= 0 ||
+        (vi.texcoord_index != opt_index_t::kNotPresent &&
+         vi.texcoord_index <= 0) ||
+        (vi.normal_index != opt_index_t::kNotPresent && vi.normal_index <= 0)) {
+      td.saw_nonpositive_index = true;
+    }
+    opt_skip_space(&token);
+    if (face_count < 8) {
+      face_buf[face_count++] = vi;
+    } else {
+      if (face_count == 8) {
+        face_overflow.reserve(16);
+        for (unsigned int k = 0; k < 8; ++k) face_overflow.push_back(face_buf[k]);
+      }
+      face_overflow.push_back(vi);
+      ++face_count;
+    }
+  }
+
+  OptFaceCmd fc;
+  fc.face_vertex_count = face_count;
+  fc.source_line = static_cast<uint32_t>(line_number);
+  fc.v_count_before = static_cast<uint32_t>(td.num_v);
+  fc.vn_count_before = static_cast<uint32_t>(td.num_vn);
+  fc.vt_count_before = static_cast<uint32_t>(td.num_vt);
+
+  if (face_count < 3) {
+    fc.degenerate = true;
+    td.saw_degenerate = true;
+    fc.emitted_face_count = 0;
+    fc.emitted_face_verts = 0;
+    fc.f_count = 0;
+  } else if (triangulate) {
+    fc.emitted_face_count = face_count - 2;
+    fc.emitted_face_verts = 3;
+    fc.f_count = fc.emitted_face_count * 3;
+  } else {
+    fc.emitted_face_count = 1;
+    fc.emitted_face_verts = face_count;
+    fc.f_count = face_count;
+  }
+
+  if (!face_overflow.empty()) {
+    fc.f_heap.swap(face_overflow);
+  } else if (face_count <= OptFaceCmd::kInlineCap) {
+    for (unsigned int k = 0; k < face_count; ++k) fc.f_inline[k] = face_buf[k];
+  } else {
+    fc.f_heap.assign(face_buf, face_buf + face_count);
+  }
+
+  td.num_f_indices += fc.f_count;
+  td.num_f_faces += fc.emitted_face_count;
+  OptSeqEntry se;
+  se.kind = OptSeqEntry::SEQ_FACE;
+  se.index = static_cast<uint32_t>(td.faces.size());
+  td.seq.push_back(se);
+  td.faces.push_back(std::move(fc));
+}
 
 // Parse a single line and store into compact per-type thread data.
 // Fast path: v/vn/vt lines are parsed directly using fast_float with line_end,
@@ -11783,6 +11975,13 @@ static void opt_parseLineToThreadData(
     td.num_vt++;
     return;
   }
+
+  // ---- Fast path: face (f v[/vt][/vn] ...) ----
+  if (token[0] == 'f' && (token[1] == ' ' || token[1] == '\t')) {
+    opt_parseFaceLineToThreadData(td, token + 2, line_end, triangulate,
+                                  line_number, cache);
+    return;
+  }
 #endif  // TINYOBJLOADER_DISABLE_FAST_FLOAT
 
   // ---- Slow path: face / meta commands via opt_parseLine ----
@@ -11865,6 +12064,18 @@ static void opt_parseLineToThreadData(
       fc.emitted_face_verts = cmd.emitted_face_verts;
       fc.f_count = cmd.f_count;
       fc.degenerate = cmd.degenerate_face;
+      if (fc.degenerate) td.saw_degenerate = true;
+      for (uint32_t k = 0; k < fc.face_vertex_count; k++) {
+        const opt_index_t &raw = cmd.face_indices()[k];
+        if (raw.vertex_index <= 0 ||
+            (raw.texcoord_index != opt_index_t::kNotPresent &&
+             raw.texcoord_index <= 0) ||
+            (raw.normal_index != opt_index_t::kNotPresent &&
+             raw.normal_index <= 0)) {
+          td.saw_nonpositive_index = true;
+          break;
+        }
+      }
       fc.source_line = static_cast<uint32_t>(line_number);
       fc.v_count_before = static_cast<uint32_t>(td.num_v);
       fc.vn_count_before = static_cast<uint32_t>(td.num_vn);
@@ -11922,6 +12133,32 @@ static void opt_parseLineToThreadData(
     default:
       break;
   }
+}
+
+// Sequential single-thread scanner.  Lines are consumed in place; no
+// LineInfo array or per-line allocation is created.  Empty lines are skipped
+// for numbering, matching the historical line-index behavior.
+static size_t opt_parseBufferDirect(OptThreadData &td, const char *buf,
+                                    size_t len, bool triangulate,
+                                    OptFloatCache *cache) {
+  const char *p = buf;
+  const char *end = buf + len;
+  size_t line_number = 0;
+  while (p < end) {
+    const char *eol = p;
+    while (eol < end && eol[0] != '\n' && eol[0] != '\r') ++eol;
+    const size_t line_len = static_cast<size_t>(eol - p);
+    if (line_len != 0) {
+      ++line_number;
+      opt_parseLineToThreadData(td, p, line_len, triangulate, line_number,
+                                cache);
+      if (td.error_line != 0) break;
+    }
+    if (eol >= end) break;
+    if (eol[0] == '\r' && eol + 1 < end && eol[1] == '\n') ++eol;
+    p = eol + 1;
+  }
+  return line_number;
 }
 
 }  // namespace opt_internal
@@ -11989,28 +12226,6 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
 #else
 #endif
 
-  // ---- Phase 1: find line boundaries ----
-  std::vector<LineInfo> all_line_infos;
-
-#if defined(TINYOBJLOADER_USE_SIMD) && \
-    (defined(TINYOBJLOADER_SIMD_SSE2) || defined(TINYOBJLOADER_SIMD_AVX2) || \
-     defined(TINYOBJLOADER_SIMD_NEON))
-  {
-    std::vector<size_t> nl_positions;
-    nl_positions.reserve(work_len / 64);
-    simd_find_newlines(work_buf, work_len, nl_positions);
-    simd_build_line_infos(work_buf, work_len, nl_positions, all_line_infos);
-  }
-#else
-  {
-    all_line_infos.reserve(work_len / 64);
-    scalar_find_line_infos(work_buf, 0, work_len, all_line_infos);
-  }
-#endif
-
-  const size_t total_lines = all_line_infos.size();
-  if (total_lines == 0) return true;
-
   // Fast buffer-level check for legacy-only tokens (replaces per-line scan)
   if (opt_buffer_requires_legacy_fallback(work_buf, work_len)) {
     std::string input(buf, buf + buf_len);
@@ -12031,6 +12246,28 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
     return true;
   }
 
+  // ---- Phase 1: line boundaries (only needed by the threaded path) ----
+  std::vector<LineInfo> all_line_infos;
+  size_t total_lines = 0;
+
+#ifdef TINYOBJLOADER_USE_MULTITHREADING
+  if (num_threads > 1) {
+#if defined(TINYOBJLOADER_USE_SIMD) && \
+    (defined(TINYOBJLOADER_SIMD_SSE2) || defined(TINYOBJLOADER_SIMD_AVX2) || \
+     defined(TINYOBJLOADER_SIMD_NEON))
+    std::vector<size_t> nl_positions;
+    nl_positions.reserve(work_len / 64);
+    simd_find_newlines(work_buf, work_len, nl_positions);
+    simd_build_line_infos(work_buf, work_len, nl_positions, all_line_infos);
+#else
+    all_line_infos.reserve(work_len / 64);
+    scalar_find_line_infos(work_buf, 0, work_len, all_line_infos);
+#endif
+    total_lines = all_line_infos.size();
+    if (total_lines == 0) return true;
+  }
+#endif
+
   // ---- Phase 2: parse lines (compact storage) ----
   //   Single-threaded or multi-threaded depending on compile option.
 
@@ -12039,7 +12276,7 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
 
 #ifdef TINYOBJLOADER_USE_MULTITHREADING
   // Multi-threaded path
-  {
+  if (num_threads > 1) {
     size_t lines_per_thread = total_lines / num_t;
     std::vector<std::thread> workers;
     workers.reserve(num_t);
@@ -12071,29 +12308,24 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
       });
     }
     for (auto &w : workers) w.join();
-  }
-
-#else
-  // Single-threaded path
+  } else
+#endif
+  // Single-threaded path: parse the buffer in place, one pass, no line index.
   {
     OptThreadData &td = thread_data[0];
-    td.v_pos.reserve(total_lines * 2);
-    td.faces.reserve(total_lines / 3);
-    td.seq.reserve(total_lines / 3);
+    td.v_pos.reserve(work_len / 10);
+    td.faces.reserve(work_len / 64);
+    td.seq.reserve(work_len / 64);
     OptFloatCache *tc = nullptr;
 #ifndef TINYOBJLOADER_DISABLE_FAST_FLOAT
     OptFloatCache thread_cache(config.float_cache_max_nodes,
                                config.fp32_cache);
     if (config.float_cache) tc = &thread_cache;
 #endif
-    for (size_t i = 0; i < total_lines; i++) {
-      opt_parseLineToThreadData(td, &work_buf[all_line_infos[i].pos],
-                                 all_line_infos[i].len, config.triangulate,
-                                 i + 1, tc);
-      if (td.error_line != 0) break;
-    }
+    total_lines = opt_parseBufferDirect(td, work_buf, work_len,
+                                        config.triangulate, tc);
+    if (total_lines == 0) return true;
   }
-#endif
 
   size_t first_error_line = 0;
   std::string first_error_message;
@@ -12120,7 +12352,27 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
   size_t eof_pending_degenerate_faces = 0;
   size_t phase3_error_line = 0;
   std::string phase3_error_message;
-  {
+  bool has_meta_commands = false;
+  bool has_shape_meta = false;
+  bool has_degenerate_faces = false;
+  bool has_nonpositive_indices = false;
+  bool has_face_records = false;
+  for (size_t t = 0; t < num_t; t++) {
+    const OptThreadData &td = thread_data[t];
+    has_meta_commands = has_meta_commands || !td.metas.empty();
+    has_degenerate_faces = has_degenerate_faces || td.saw_degenerate;
+    has_nonpositive_indices =
+        has_nonpositive_indices || td.saw_nonpositive_index;
+    has_face_records = has_face_records || !td.faces.empty();
+    for (size_t mi = 0; mi < td.metas.size(); mi++) {
+      if (td.metas[mi].type == OPT_CMD_G || td.metas[mi].type == OPT_CMD_O) {
+        has_shape_meta = true;
+        break;
+      }
+    }
+  }
+
+  if (has_meta_commands || has_degenerate_faces || has_nonpositive_indices) {
     MaterialFileReader mat_file_reader(mtl_basedir);
     std::set<std::string> material_filenames;
     std::vector<material_t> temp_materials;
@@ -12375,7 +12627,15 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
   attrib->material_ids.resize(static_cast<size_t>(total_faces), -1);
   std::vector<unsigned char> thread_saw_any_vertex_color(num_t, 0);
   std::vector<unsigned char> thread_missing_vertex_color(num_t, 0);
-  std::vector<real_t> all_colors(num_v * 3, real_t(1.0));
+  bool any_vertex_color_input = false;
+  for (size_t t = 0; t < num_t; t++) {
+    any_vertex_color_input =
+        any_vertex_color_input || thread_data[t].saw_any_color;
+  }
+  std::vector<real_t> all_colors;
+  if (any_vertex_color_input) {
+    all_colors.resize(num_v * 3, real_t(1.0));
+  }
 
   // Compute per-thread offsets
   std::vector<size_t> v_off(num_t), n_off(num_t), t_off(num_t), f_off(num_t),
@@ -12403,9 +12663,12 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
   }
 
   // Merge parsed data into final arrays
-  std::vector<std::vector<unsigned int> > command_written_faces(num_t);
-  for (size_t t = 0; t < num_t; t++) {
-    command_written_faces[t].assign(thread_data[t].faces.size(), 0);
+  std::vector<std::vector<unsigned int> > command_written_faces;
+  if (has_shape_meta) {
+    command_written_faces.resize(num_t);
+    for (size_t t = 0; t < num_t; t++) {
+      command_written_faces[t].assign(thread_data[t].faces.size(), 0);
+    }
   }
   std::vector<size_t> written_index_counts(num_t, 0);
   std::vector<size_t> written_face_counts(num_t, 0);
@@ -12472,7 +12735,7 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
       // SEQ_FACE
       const OptFaceCmd &face = td.faces[entry.index];
       if (face.degenerate) {
-        command_written_faces[t][entry.index] = 0;
+        if (has_shape_meta) command_written_faces[t][entry.index] = 0;
         continue;
       }
       // Compute running counts for index resolution
@@ -12480,7 +12743,13 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
       size_t nc = n_off[t] + face.vn_count_before;
       size_t tc = t_off[t] + face.vt_count_before;
 
-      std::vector<index_t> resolved_face(face.face_vertex_count);
+      index_t resolved_face_inline[8];
+      std::vector<index_t> resolved_face_heap;
+      index_t *resolved_face = resolved_face_inline;
+      if (face.face_vertex_count > 8) {
+        resolved_face_heap.resize(face.face_vertex_count);
+        resolved_face = resolved_face_heap.data();
+      }
       for (size_t k = 0; k < face.face_vertex_count; k++) {
         const opt_index_t &vi = face.face_indices()[k];
         index_t idx;
@@ -12529,13 +12798,14 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
       size_t written_face_count = 0;
       if (config.triangulate) {
         written_index_count = opt_triangulate_face(
-            attrib->vertices, resolved_face.data(), resolved_face.size(),
+            attrib->vertices, resolved_face,
+            static_cast<size_t>(face.face_vertex_count),
             &attrib->indices[fc]);
         written_face_count = written_index_count / 3;
       } else {
-        written_index_count = resolved_face.size();
+        written_index_count = face.face_vertex_count;
         written_face_count = 1;
-        for (size_t k = 0; k < resolved_face.size(); k++) {
+        for (size_t k = 0; k < face.face_vertex_count; k++) {
           attrib->indices[fc + k] = resolved_face[k];
         }
       }
@@ -12546,8 +12816,10 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
         attrib->material_ids[fcc + k] = current_mat_id;
         all_smoothing_group_ids[fcc + k] = current_smoothing_id;
       }
-      command_written_faces[t][entry.index] =
-          static_cast<unsigned int>(written_face_count);
+      if (has_shape_meta) {
+        command_written_faces[t][entry.index] =
+            static_cast<unsigned int>(written_face_count);
+      }
       fc += written_index_count;
       fcc += written_face_count;
     }
@@ -12687,7 +12959,7 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
       static_cast<int>(attrib->vertices.size() / 3),
       static_cast<int>(attrib->normals.size() / 3),
       static_cast<int>(attrib->texcoords.size() / 2),
-      all_line_infos.size() + 1);
+      total_lines + 1);
   for (size_t deg = 0; deg < eof_pending_degenerate_faces; deg++) {
     if (warn) {
       (*warn) += "Degenerated face found\n.";
@@ -12695,7 +12967,22 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
   }
 
   // ---- Phase 5: construct shapes ----
-  {
+  if (!has_shape_meta) {
+    // Common case: one implicit shape, no `g'/'o' boundaries.  Avoid building
+    // the index prefix array and walking the sequence once more.
+    if (has_face_records) {
+      basic_shape_t<> final_shape;
+      final_shape.mesh.num_face_vertices.assign(
+          attrib->face_num_verts.begin(), attrib->face_num_verts.end());
+      final_shape.mesh.indices.assign(attrib->indices.begin(),
+                                      attrib->indices.end());
+      final_shape.mesh.material_ids.assign(attrib->material_ids.begin(),
+                                           attrib->material_ids.end());
+      final_shape.mesh.smoothing_group_ids.assign(
+          all_smoothing_group_ids.begin(), all_smoothing_group_ids.end());
+      shapes->push_back(std::move(final_shape));
+    }
+  } else {
     // Precompute prefix-sum of index offsets for O(1) slicing
     const size_t total_faces = attrib->face_num_verts.size();
     std::vector<size_t> idx_prefix(total_faces + 1);
