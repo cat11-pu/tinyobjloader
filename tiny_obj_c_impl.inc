@@ -1295,6 +1295,352 @@ const char *TOBJ_T(tobj_material_get_param)(const TOBJ_T(tobj_material) * m,
   return NULL;
 }
 
+/* ----------------------------------------------------------------------- */
+/* material map                                                            */
+/* ----------------------------------------------------------------------- */
+
+static const char *TOBJ_T(map_dup_string)(tobj_arena *ar, const char *s) {
+  if (!s || !s[0]) return "";
+  return tobj_intern(ar, s, tobj_strlen(s));
+}
+
+static bool TOBJ_T(map_clone_texopt)(tobj_arena *ar,
+                                     const TOBJ_T(tobj_texture_option) * src,
+                                     TOBJ_T(tobj_texture_option) * dst) {
+  *dst = *src;
+  dst->colorspace = TOBJ_T(map_dup_string)(ar, src->colorspace);
+  return dst->colorspace != NULL;
+}
+
+static bool TOBJ_T(map_clone_material)(tobj_arena *ar,
+                                       const TOBJ_T(tobj_material) * src,
+                                       TOBJ_T(tobj_material) * dst) {
+  tobj_memset(dst, 0, sizeof *dst);
+  *dst = *src;
+  dst->name = TOBJ_T(map_dup_string)(ar, src->name);
+  dst->ambient_texname = TOBJ_T(map_dup_string)(ar, src->ambient_texname);
+  dst->diffuse_texname = TOBJ_T(map_dup_string)(ar, src->diffuse_texname);
+  dst->specular_texname = TOBJ_T(map_dup_string)(ar, src->specular_texname);
+  dst->specular_highlight_texname =
+      TOBJ_T(map_dup_string)(ar, src->specular_highlight_texname);
+  dst->bump_texname = TOBJ_T(map_dup_string)(ar, src->bump_texname);
+  dst->displacement_texname =
+      TOBJ_T(map_dup_string)(ar, src->displacement_texname);
+  dst->alpha_texname = TOBJ_T(map_dup_string)(ar, src->alpha_texname);
+  dst->reflection_texname =
+      TOBJ_T(map_dup_string)(ar, src->reflection_texname);
+  dst->roughness_texname =
+      TOBJ_T(map_dup_string)(ar, src->roughness_texname);
+  dst->metallic_texname = TOBJ_T(map_dup_string)(ar, src->metallic_texname);
+  dst->sheen_texname = TOBJ_T(map_dup_string)(ar, src->sheen_texname);
+  dst->emissive_texname = TOBJ_T(map_dup_string)(ar, src->emissive_texname);
+  dst->normal_texname = TOBJ_T(map_dup_string)(ar, src->normal_texname);
+
+  if (!dst->name || !dst->ambient_texname || !dst->diffuse_texname ||
+      !dst->specular_texname || !dst->specular_highlight_texname ||
+      !dst->bump_texname || !dst->displacement_texname ||
+      !dst->alpha_texname || !dst->reflection_texname ||
+      !dst->roughness_texname || !dst->metallic_texname ||
+      !dst->sheen_texname || !dst->emissive_texname ||
+      !dst->normal_texname)
+    return false;
+
+  if (!TOBJ_T(map_clone_texopt)(ar, &src->ambient_texopt,
+                                &dst->ambient_texopt) ||
+      !TOBJ_T(map_clone_texopt)(ar, &src->diffuse_texopt,
+                                &dst->diffuse_texopt) ||
+      !TOBJ_T(map_clone_texopt)(ar, &src->specular_texopt,
+                                &dst->specular_texopt) ||
+      !TOBJ_T(map_clone_texopt)(ar, &src->specular_highlight_texopt,
+                                &dst->specular_highlight_texopt) ||
+      !TOBJ_T(map_clone_texopt)(ar, &src->bump_texopt, &dst->bump_texopt) ||
+      !TOBJ_T(map_clone_texopt)(ar, &src->displacement_texopt,
+                                &dst->displacement_texopt) ||
+      !TOBJ_T(map_clone_texopt)(ar, &src->alpha_texopt, &dst->alpha_texopt) ||
+      !TOBJ_T(map_clone_texopt)(ar, &src->reflection_texopt,
+                                &dst->reflection_texopt) ||
+      !TOBJ_T(map_clone_texopt)(ar, &src->roughness_texopt,
+                                &dst->roughness_texopt) ||
+      !TOBJ_T(map_clone_texopt)(ar, &src->metallic_texopt,
+                                &dst->metallic_texopt) ||
+      !TOBJ_T(map_clone_texopt)(ar, &src->sheen_texopt, &dst->sheen_texopt) ||
+      !TOBJ_T(map_clone_texopt)(ar, &src->emissive_texopt,
+                                &dst->emissive_texopt) ||
+      !TOBJ_T(map_clone_texopt)(ar, &src->normal_texopt, &dst->normal_texopt))
+    return false;
+
+  dst->num_unknown_params = 0;
+  dst->unknown_params = NULL;
+  if (src->num_unknown_params) {
+    if (!src->unknown_params) return false;
+    size_t bytes;
+    if (!tobj_size_mul(src->num_unknown_params, sizeof(tobj_kv), &bytes))
+      return false;
+    tobj_kv *kv = (tobj_kv *)tobj_arena_alloc(ar, bytes, 16);
+    if (!kv) return false;
+    for (size_t i = 0; i < src->num_unknown_params; i++) {
+      kv[i].key = TOBJ_T(map_dup_string)(ar, src->unknown_params[i].key);
+      kv[i].value = TOBJ_T(map_dup_string)(ar, src->unknown_params[i].value);
+      if (!kv[i].key || !kv[i].value) return false;
+    }
+    dst->unknown_params = kv;
+    dst->num_unknown_params = src->num_unknown_params;
+  }
+  return true;
+}
+
+static const char *TOBJ_T(map_texname)(
+    const TOBJ_T(tobj_material) * m, tobj_texture_slot_kind kind) {
+  switch (kind) {
+    case TOBJ_TEXTURE_SLOT_AMBIENT: return m->ambient_texname;
+    case TOBJ_TEXTURE_SLOT_DIFFUSE: return m->diffuse_texname;
+    case TOBJ_TEXTURE_SLOT_SPECULAR: return m->specular_texname;
+    case TOBJ_TEXTURE_SLOT_SPECULAR_HIGHLIGHT:
+      return m->specular_highlight_texname;
+    case TOBJ_TEXTURE_SLOT_BUMP: return m->bump_texname;
+    case TOBJ_TEXTURE_SLOT_DISPLACEMENT: return m->displacement_texname;
+    case TOBJ_TEXTURE_SLOT_ALPHA: return m->alpha_texname;
+    case TOBJ_TEXTURE_SLOT_REFLECTION: return m->reflection_texname;
+    case TOBJ_TEXTURE_SLOT_ROUGHNESS: return m->roughness_texname;
+    case TOBJ_TEXTURE_SLOT_METALLIC: return m->metallic_texname;
+    case TOBJ_TEXTURE_SLOT_SHEEN: return m->sheen_texname;
+    case TOBJ_TEXTURE_SLOT_EMISSIVE: return m->emissive_texname;
+    case TOBJ_TEXTURE_SLOT_NORMAL: return m->normal_texname;
+    default: return "";
+  }
+}
+
+static const TOBJ_T(tobj_texture_option) *TOBJ_T(map_texopt)(
+    const TOBJ_T(tobj_material) * m, tobj_texture_slot_kind kind) {
+  switch (kind) {
+    case TOBJ_TEXTURE_SLOT_AMBIENT: return &m->ambient_texopt;
+    case TOBJ_TEXTURE_SLOT_DIFFUSE: return &m->diffuse_texopt;
+    case TOBJ_TEXTURE_SLOT_SPECULAR: return &m->specular_texopt;
+    case TOBJ_TEXTURE_SLOT_SPECULAR_HIGHLIGHT:
+      return &m->specular_highlight_texopt;
+    case TOBJ_TEXTURE_SLOT_BUMP: return &m->bump_texopt;
+    case TOBJ_TEXTURE_SLOT_DISPLACEMENT: return &m->displacement_texopt;
+    case TOBJ_TEXTURE_SLOT_ALPHA: return &m->alpha_texopt;
+    case TOBJ_TEXTURE_SLOT_REFLECTION: return &m->reflection_texopt;
+    case TOBJ_TEXTURE_SLOT_ROUGHNESS: return &m->roughness_texopt;
+    case TOBJ_TEXTURE_SLOT_METALLIC: return &m->metallic_texopt;
+    case TOBJ_TEXTURE_SLOT_SHEEN: return &m->sheen_texopt;
+    case TOBJ_TEXTURE_SLOT_EMISSIVE: return &m->emissive_texopt;
+    case TOBJ_TEXTURE_SLOT_NORMAL: return &m->normal_texopt;
+    default: return &m->ambient_texopt;
+  }
+}
+
+tobj_result TOBJ_T(tobj_material_map_build)(
+    TOBJ_T(tobj_material_map) * out, const TOBJ_T(tobj_scene) * scene) {
+  if (!out) return TOBJ_ERR_INVALID_ARG;
+  tobj_memset(out, 0, sizeof *out);
+  if (!scene) return TOBJ_ERR_INVALID_ARG;
+  if (scene->num_materials > (size_t)INT_MAX ||
+      scene->num_shapes == (size_t)-1)
+    return TOBJ_ERR_OVERFLOW;
+  if ((scene->num_materials && !scene->materials) ||
+      (scene->num_shapes && !scene->shapes))
+    return TOBJ_ERR_INVALID_ARG;
+
+  tobj_allocator alloc;
+  if (!tobj_resolve_allocator(&scene->allocator, &alloc))
+    return TOBJ_ERR_INVALID_ARG;
+  tobj_arena *arena = (tobj_arena *)tobj_alloc(&alloc, sizeof(tobj_arena), 16);
+  if (!arena) return TOBJ_ERR_ALLOC;
+  tobj_arena_init(arena, &alloc, 4096);
+  out->allocator = alloc;
+  out->arena = arena;
+  out->num_shapes = scene->num_shapes;
+
+  size_t nm = scene->num_materials;
+  if (nm) {
+    size_t bytes;
+    if (!tobj_size_mul(nm, sizeof(int), &bytes)) {
+      TOBJ_T(tobj_material_map_free)(out);
+      return TOBJ_ERR_OVERFLOW;
+    }
+    out->source_to_material = (int *)tobj_arena_alloc(arena, bytes, 16);
+    if (!out->source_to_material) {
+      TOBJ_T(tobj_material_map_free)(out);
+      return TOBJ_ERR_ALLOC;
+    }
+    for (size_t i = 0; i < nm; i++) out->source_to_material[i] = -1;
+
+    if (!tobj_size_mul(nm, sizeof(TOBJ_T(tobj_material)), &bytes)) {
+      TOBJ_T(tobj_material_map_free)(out);
+      return TOBJ_ERR_OVERFLOW;
+    }
+    out->materials =
+        (TOBJ_T(tobj_material) *)tobj_arena_alloc(arena, bytes, 16);
+    if (!out->materials) {
+      TOBJ_T(tobj_material_map_free)(out);
+      return TOBJ_ERR_ALLOC;
+    }
+
+    size_t canonical = 0;
+    for (size_t i = 0; i < nm; i++) {
+      const TOBJ_T(tobj_material) *src = &scene->materials[i];
+      const char *name = src->name ? src->name : "";
+      size_t found = canonical;
+      for (size_t j = 0; j < canonical; j++) {
+        if (tobj_strcmp(out->materials[j].name, name) == 0) {
+          found = j;
+          break;
+        }
+      }
+      if (found == canonical) {
+        if (!TOBJ_T(map_clone_material)(arena, src,
+                                        &out->materials[canonical])) {
+          TOBJ_T(tobj_material_map_free)(out);
+          return TOBJ_ERR_ALLOC;
+        }
+        canonical++;
+      }
+      out->source_to_material[i] = (int)found;
+    }
+    out->num_source_materials = nm;
+    out->num_materials = canonical;
+  }
+
+  size_t total_faces = 0;
+  for (size_t s = 0; s < scene->num_shapes; s++) {
+    const TOBJ_T(tobj_mesh) *mesh = &scene->shapes[s].mesh;
+    if (mesh->num_faces && !mesh->material_ids) {
+      TOBJ_T(tobj_material_map_free)(out);
+      return TOBJ_ERR_INVALID_ARG;
+    }
+    if (!tobj_size_add(total_faces, mesh->num_faces, &total_faces)) {
+      TOBJ_T(tobj_material_map_free)(out);
+      return TOBJ_ERR_OVERFLOW;
+    }
+  }
+
+  size_t off_count = scene->num_shapes + 1;
+  size_t off_bytes;
+  if (!tobj_size_mul(off_count, sizeof(size_t), &off_bytes)) {
+    TOBJ_T(tobj_material_map_free)(out);
+    return TOBJ_ERR_OVERFLOW;
+  }
+  out->shape_face_offsets = (size_t *)tobj_arena_alloc(arena, off_bytes, 16);
+  if (!out->shape_face_offsets) {
+    TOBJ_T(tobj_material_map_free)(out);
+    return TOBJ_ERR_ALLOC;
+  }
+
+  if (total_faces) {
+    size_t face_bytes;
+    if (!tobj_size_mul(total_faces, sizeof(int), &face_bytes)) {
+      TOBJ_T(tobj_material_map_free)(out);
+      return TOBJ_ERR_OVERFLOW;
+    }
+    out->face_material_ids = (int *)tobj_arena_alloc(arena, face_bytes, 16);
+    if (!out->face_material_ids) {
+      TOBJ_T(tobj_material_map_free)(out);
+      return TOBJ_ERR_ALLOC;
+    }
+  }
+
+  size_t face_at = 0;
+  for (size_t s = 0; s < scene->num_shapes; s++) {
+    const TOBJ_T(tobj_mesh) *mesh = &scene->shapes[s].mesh;
+    out->shape_face_offsets[s] = face_at;
+    for (size_t f = 0; f < mesh->num_faces; f++) {
+      int source_id = mesh->material_ids[f];
+      int canonical_id = -1;
+      if (source_id >= 0 && (size_t)source_id < scene->num_materials)
+        canonical_id = out->source_to_material[source_id];
+      out->face_material_ids[face_at++] = canonical_id;
+    }
+  }
+  out->shape_face_offsets[scene->num_shapes] = face_at;
+  out->num_face_material_ids = face_at;
+
+  size_t max_slots;
+  if (!tobj_size_mul(scene->num_materials,
+                     (size_t)TOBJ_TEXTURE_SLOT_COUNT, &max_slots)) {
+    TOBJ_T(tobj_material_map_free)(out);
+    return TOBJ_ERR_OVERFLOW;
+  }
+  if (max_slots > (size_t)INT_MAX) {
+    TOBJ_T(tobj_material_map_free)(out);
+    return TOBJ_ERR_OVERFLOW;
+  }
+  if (max_slots) {
+    size_t slot_bytes, tex_bytes;
+    if (!tobj_size_mul(max_slots, sizeof(TOBJ_T(tobj_texture_slot)),
+                       &slot_bytes) ||
+        !tobj_size_mul(max_slots, sizeof(TOBJ_T(tobj_texture_info)),
+                       &tex_bytes)) {
+      TOBJ_T(tobj_material_map_free)(out);
+      return TOBJ_ERR_OVERFLOW;
+    }
+    out->texture_slots =
+        (TOBJ_T(tobj_texture_slot) *)tobj_arena_alloc(arena, slot_bytes, 16);
+    out->textures =
+        (TOBJ_T(tobj_texture_info) *)tobj_arena_alloc(arena, tex_bytes, 16);
+    if (!out->texture_slots || !out->textures) {
+      TOBJ_T(tobj_material_map_free)(out);
+      return TOBJ_ERR_ALLOC;
+    }
+
+    size_t num_textures = 0;
+    for (size_t mi = 0; mi < out->num_materials; mi++) {
+      const TOBJ_T(tobj_material) *m = &out->materials[mi];
+      for (int kind = 0; kind < (int)TOBJ_TEXTURE_SLOT_COUNT; kind++) {
+        const char *path =
+            TOBJ_T(map_texname)(m, (tobj_texture_slot_kind)kind);
+        if (!path || !path[0]) continue;
+        size_t texture_id = num_textures;
+        for (size_t ti = 0; ti < num_textures; ti++) {
+          if (tobj_strcmp(out->textures[ti].path, path) == 0) {
+            texture_id = ti;
+            break;
+          }
+        }
+        if (texture_id == num_textures) {
+          out->textures[num_textures].path = path;
+          out->textures[num_textures].num_references = 0;
+          num_textures++;
+        }
+        out->textures[texture_id].num_references++;
+
+        TOBJ_T(tobj_texture_slot) *slot =
+            &out->texture_slots[out->num_texture_slots++];
+        slot->kind = (tobj_texture_slot_kind)kind;
+        slot->material_id = (int)mi;
+        slot->texture_id = (int)texture_id;
+        slot->path = path;
+        slot->option =
+            TOBJ_T(map_texopt)(m, (tobj_texture_slot_kind)kind);
+      }
+    }
+    out->num_textures = num_textures;
+  }
+
+  return TOBJ_OK;
+}
+
+void TOBJ_T(tobj_material_map_free)(TOBJ_T(tobj_material_map) * map) {
+  if (!map) return;
+  if (map->arena) {
+    tobj_arena *ar = (tobj_arena *)map->arena;
+    tobj_allocator alloc = map->allocator;
+    tobj_arena_destroy(ar);
+    tobj_free(&alloc, ar, sizeof(tobj_arena));
+  }
+  tobj_memset(map, 0, sizeof *map);
+}
+
+int TOBJ_T(tobj_material_map_find)(const TOBJ_T(tobj_material_map) * map,
+                                   const char *name) {
+  if (!map || !name) return -1;
+  for (size_t i = 0; i < map->num_materials; i++) {
+    if (tobj_strcmp(map->materials[i].name, name) == 0) return (int)i;
+  }
+  return -1;
+}
+
 #ifdef TOBJ_ENABLE_MULTITHREADING
 /* Per-thread vertex-parse output (MT pass 1). */
 typedef struct TOBJ_T(tobj_tls) {

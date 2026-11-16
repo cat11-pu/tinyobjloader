@@ -725,6 +725,26 @@ const char *tobj_result_string(tobj_result r) {
   return "unknown";
 }
 
+const char *tobj_texture_slot_kind_name(tobj_texture_slot_kind kind) {
+  switch (kind) {
+    case TOBJ_TEXTURE_SLOT_AMBIENT: return "ambient";
+    case TOBJ_TEXTURE_SLOT_DIFFUSE: return "diffuse";
+    case TOBJ_TEXTURE_SLOT_SPECULAR: return "specular";
+    case TOBJ_TEXTURE_SLOT_SPECULAR_HIGHLIGHT: return "specular_highlight";
+    case TOBJ_TEXTURE_SLOT_BUMP: return "bump";
+    case TOBJ_TEXTURE_SLOT_DISPLACEMENT: return "displacement";
+    case TOBJ_TEXTURE_SLOT_ALPHA: return "alpha";
+    case TOBJ_TEXTURE_SLOT_REFLECTION: return "reflection";
+    case TOBJ_TEXTURE_SLOT_ROUGHNESS: return "roughness";
+    case TOBJ_TEXTURE_SLOT_METALLIC: return "metallic";
+    case TOBJ_TEXTURE_SLOT_SHEEN: return "sheen";
+    case TOBJ_TEXTURE_SLOT_EMISSIVE: return "emissive";
+    case TOBJ_TEXTURE_SLOT_NORMAL: return "normal";
+    case TOBJ_TEXTURE_SLOT_COUNT: break;
+  }
+  return "unknown";
+}
+
 /* Unknown .mtl parameter pending finalization, tagged by material index. */
 typedef struct tobj_pending_kv {
   size_t mat_index;
@@ -1017,6 +1037,9 @@ int tobj_fuzz_one(const uint8_t *data, size_t size) {
   tobj_scene_f s;
   tobj_load_config cfg = tobj_default_config();
   if (tobj_load_obj_from_memory_f(&s, data, size, &cfg, NULL) == TOBJ_OK) {
+    tobj_material_map_f map;
+    if (tobj_material_map_build_f(&map, &s) == TOBJ_OK)
+      tobj_material_map_free_f(&map);
     tobj_scene_free_f(&s);
   }
   return 0;

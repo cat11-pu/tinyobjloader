@@ -134,6 +134,24 @@ typedef enum tobj_texture_type {
   TOBJ_TEXTURE_TYPE_CUBE_RIGHT
 } tobj_texture_type;
 
+/* Stable, material-major texture slot order. Keep this enum append-only. */
+typedef enum tobj_texture_slot_kind {
+  TOBJ_TEXTURE_SLOT_AMBIENT = 0,
+  TOBJ_TEXTURE_SLOT_DIFFUSE,
+  TOBJ_TEXTURE_SLOT_SPECULAR,
+  TOBJ_TEXTURE_SLOT_SPECULAR_HIGHLIGHT,
+  TOBJ_TEXTURE_SLOT_BUMP,
+  TOBJ_TEXTURE_SLOT_DISPLACEMENT,
+  TOBJ_TEXTURE_SLOT_ALPHA,
+  TOBJ_TEXTURE_SLOT_REFLECTION,
+  TOBJ_TEXTURE_SLOT_ROUGHNESS,
+  TOBJ_TEXTURE_SLOT_METALLIC,
+  TOBJ_TEXTURE_SLOT_SHEEN,
+  TOBJ_TEXTURE_SLOT_EMISSIVE,
+  TOBJ_TEXTURE_SLOT_NORMAL,
+  TOBJ_TEXTURE_SLOT_COUNT
+} tobj_texture_slot_kind;
+
 /* Free-form curve/surface type (cstype). */
 typedef enum tobj_cstype {
   TOBJ_CSTYPE_NONE = 0,
@@ -240,6 +258,9 @@ typedef tobj_shape_d tobj_shape;
 typedef tobj_scene_d tobj_scene;
 typedef tobj_callbacks_d tobj_callbacks;
 typedef tobj_material_list_d tobj_material_list;
+typedef tobj_texture_slot_d tobj_texture_slot;
+typedef tobj_texture_info_d tobj_texture_info;
+typedef tobj_material_map_d tobj_material_map;
 
 #define tobj_load_obj_from_memory(...) tobj_load_obj_from_memory_d(__VA_ARGS__)
 #define tobj_load_obj_from_file(...) tobj_load_obj_from_file_d(__VA_ARGS__)
@@ -250,6 +271,9 @@ typedef tobj_material_list_d tobj_material_list;
 #define tobj_parse_mtl_from_memory(...) tobj_parse_mtl_from_memory_d(__VA_ARGS__)
 #define tobj_material_list_free(...) tobj_material_list_free_d(__VA_ARGS__)
 #define tobj_material_get_param(...) tobj_material_get_param_d(__VA_ARGS__)
+#define tobj_material_map_build(...) tobj_material_map_build_d(__VA_ARGS__)
+#define tobj_material_map_free(...) tobj_material_map_free_d(__VA_ARGS__)
+#define tobj_material_map_find(...) tobj_material_map_find_d(__VA_ARGS__)
 #else
 typedef float tobj_real;
 typedef tobj_real_buf_f tobj_real_buf;
@@ -263,6 +287,9 @@ typedef tobj_shape_f tobj_shape;
 typedef tobj_scene_f tobj_scene;
 typedef tobj_callbacks_f tobj_callbacks;
 typedef tobj_material_list_f tobj_material_list;
+typedef tobj_texture_slot_f tobj_texture_slot;
+typedef tobj_texture_info_f tobj_texture_info;
+typedef tobj_material_map_f tobj_material_map;
 
 #define tobj_load_obj_from_memory(...) tobj_load_obj_from_memory_f(__VA_ARGS__)
 #define tobj_load_obj_from_file(...) tobj_load_obj_from_file_f(__VA_ARGS__)
@@ -273,6 +300,9 @@ typedef tobj_material_list_f tobj_material_list;
 #define tobj_parse_mtl_from_memory(...) tobj_parse_mtl_from_memory_f(__VA_ARGS__)
 #define tobj_material_list_free(...) tobj_material_list_free_f(__VA_ARGS__)
 #define tobj_material_get_param(...) tobj_material_get_param_f(__VA_ARGS__)
+#define tobj_material_map_build(...) tobj_material_map_build_f(__VA_ARGS__)
+#define tobj_material_map_free(...) tobj_material_map_free_f(__VA_ARGS__)
+#define tobj_material_map_find(...) tobj_material_map_find_f(__VA_ARGS__)
 #endif
 
 /* Single fuzz entry (uses the float family internally). */

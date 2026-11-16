@@ -230,6 +230,46 @@ typedef struct TOBJ_T(tobj_material_list) {
   void *strpool;
 } TOBJ_T(tobj_material_list);
 
+/* One non-empty texture reference on a canonical material. `texture_id`
+ * indexes tobj_material_map::textures and is shared by equal paths. */
+typedef struct TOBJ_T(tobj_texture_slot) {
+  tobj_texture_slot_kind kind;
+  int material_id;
+  int texture_id;
+  const char *path;
+  const TOBJ_T(tobj_texture_option) *option;
+} TOBJ_T(tobj_texture_slot);
+
+typedef struct TOBJ_T(tobj_texture_info) {
+  const char *path;
+  size_t num_references;
+} TOBJ_T(tobj_texture_info);
+
+/* Deduplicated, immutable view of a loaded scene's materials.
+ *
+ * Canonical materials retain first-occurrence order. `source_to_material`
+ * maps every raw scene material (including duplicates) to a canonical id.
+ * `face_material_ids` is a flattening of all mesh faces and is indexed by
+ * `shape_face_offsets` (num_shapes + 1 entries). Unknown usemtl references
+ * remain -1. All pointers are owned by this map and stay valid until
+ * tobj_material_map_free_* is called, independently of the source scene. */
+typedef struct TOBJ_T(tobj_material_map) {
+  TOBJ_T(tobj_material) *materials;
+  size_t num_materials;
+  int *source_to_material;
+  size_t num_source_materials;
+  int *face_material_ids;
+  size_t num_face_material_ids;
+  size_t *shape_face_offsets;
+  size_t num_shapes;
+  TOBJ_T(tobj_texture_slot) *texture_slots;
+  size_t num_texture_slots;
+  TOBJ_T(tobj_texture_info) *textures;
+  size_t num_textures;
+  tobj_allocator allocator;
+  void *arena; /* opaque map-owned storage */
+} TOBJ_T(tobj_material_map);
+
 typedef struct TOBJ_T(tobj_callbacks) {
   void (*vertex_cb)(void *ud, TOBJ_REAL x, TOBJ_REAL y, TOBJ_REAL z,
                     TOBJ_REAL w);
@@ -277,3 +317,17 @@ TOBJ_API void TOBJ_T(tobj_material_list_free)(TOBJ_T(tobj_material_list) * list)
 
 TOBJ_API const char *TOBJ_T(tobj_material_get_param)(
     const TOBJ_T(tobj_material) * m, const char *key);
+
+TOBJ_API tobj_result TOBJ_T(tobj_material_map_build)(
+    TOBJ_T(tobj_material_map) * out, const TOBJ_T(tobj_scene) * scene);
+
+TOBJ_API void TOBJ_T(tobj_material_map_free)(
+    TOBJ_T(tobj_material_map) * map);
+
+/* Exact, case-sensitive lookup by canonical material name. Returns -1 if not
+ * found. */
+TOBJ_API int TOBJ_T(tobj_material_map_find)(
+    const TOBJ_T(tobj_material_map) * map, const char *name);
+
+/* Stable slot name (e.g. "diffuse", "normal"); never NULL. */
+TOBJ_API const char *tobj_texture_slot_kind_name(tobj_texture_slot_kind kind);

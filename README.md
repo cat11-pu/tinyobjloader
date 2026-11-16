@@ -428,7 +428,8 @@ Properties:
   `trim` / `hole` / `end`), parsed and retained.
 * **Materials.** Phong + PBR + texture options, unknown-parameter map,
   standalone `.mtl` parsing, a material-resolver callback, and a streaming
-  callback API.
+  callback API. `tobj_material_map_*` merges duplicate `newmtl` entries,
+  remaps per-face `usemtl` ids, and emits stable texture slots.
 * **Optional speed-ups** behind macros (scalar / single-threaded by default):
   `TOBJ_ENABLE_MULTITHREADING`, `TOBJ_ENABLE_SIMD`, `TOBJ_ENABLE_MMAP`.
 
@@ -459,6 +460,40 @@ for (size_t s = 0; s < scene.num_shapes; s++) {
 tobj_scene_free_f(&scene);
 tobj_diag_free(&diag, NULL);
 ```
+
+### Deterministic material map
+
+For engines that bind materials and textures after loading, build a
+deduplicated map from the scene:
+
+```c
+tobj_material_map_f map;
+if (tobj_material_map_build_f(&map, &scene) != TOBJ_OK) {
+  return 1;
+}
+
+/* map.face_material_ids[shape_face_offsets[s] + f] is the canonical id. */
+for (size_t i = 0; i < map.num_texture_slots; i++) {
+  const tobj_texture_slot_f *slot = &map.texture_slots[i];
+  upload_or_bind(slot->texture_id, slot->path,
+                 tobj_texture_slot_kind_name(slot->kind));
+}
+
+tobj_material_map_free_f(&map);
+```
+
+The map is self-contained and can outlive the source scene. Its rules are:
+
+* Materials are merged by exact, case-sensitive `newmtl` name. The first
+  definition wins; canonical materials keep first-occurrence order.
+* `source_to_material` maps every raw MTL entry to its canonical id.
+* `face_material_ids` remaps OBJ `usemtl` bindings; unknown names stay `-1`.
+* Texture slots are emitted material-major in the append-only
+  `tobj_texture_slot_kind` order. Empty paths are omitted.
+* `texture_id` is shared by equal path strings and uses first-reference order,
+  so a game can upload each image once.
+* `shape_face_offsets` has `num_shapes + 1` entries. Lines and points do not
+  carry material bindings in the current loader.
 
 Use the `_d` variants for double precision, `tobj_load_obj_from_memory_f` for
 the freestanding / in-memory path, `tobj_load_obj_from_io_f` for custom byte
