@@ -1,0 +1,22 @@
+# generated valid case
+f // // //
+mtllib nonexistent.mtl
+v 0.048302515298777049 0 -8.486e+00
+v 10.839399 -6.28 0.6110726043832746
+v .569 .463 -11.660573
+v -1.26 16 -26
+g grp0
+s 3
+f 4 -2 -1 1 1
+f 3 1 2 2 -2
+f 3 -4 1 2 3 4
+f 2 -2 4
+p 1
+# trailing comment
+
+g grp1
+usemtl mat5
+f -3 1 3 2
+f -3 4 -3 -3 3 4
+f -2 -2 2 3 -4 2
+p -3
