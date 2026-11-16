@@ -1977,3 +1977,412 @@ tobj_result TOBJ_T(tobj_load_obj_with_callbacks)(
   tobj_free(&alloc, arena, sizeof(tobj_arena));
   return b.err;
 }
+
+/* ----------------------------------------------------------------------- */
+/* incremental stream reader                                               */
+/* ----------------------------------------------------------------------- */
+
+struct TOBJ_T(tobj_stream) {
+  tobj_allocator alloc;
+  tobj_load_config cfg;
+  tobj_caps caps;
+  TOBJ_T(tobj_callbacks) cb;
+  tobj_diag *diag;
+
+  /* Current physical line. Capacity is capped; this is the only input buffer. */
+  tobj_vec line;
+  size_t line_content_limit;
+  size_t line_capacity_limit;
+  bool skip_lf;
+
+  /* Current f/l/p corners. Reused between records, never retained. */
+  tobj_vec corners;
+
+  size_t line_no;
+  size_t numv;
+  size_t numvn;
+  size_t numvt;
+  size_t out_indices;
+  int cur_material;
+  unsigned cur_smooth;
+
+  TOBJ_T(tobj_stream_stats) stats;
+  tobj_result err;
+  bool finished;
+};
+
+static void TOBJ_T(stream_note_peak)(TOBJ_T(tobj_stream) * s) {
+  size_t face_bytes = 0;
+  if (!tobj_size_mul(s->corners.cap, sizeof(tobj_index), &face_bytes))
+    face_bytes = (size_t)-1;
+  size_t total;
+  if (!tobj_size_add(s->line.cap, face_bytes, &total)) total = (size_t)-1;
+  if (total > s->stats.peak_buffer_bytes)
+    s->stats.peak_buffer_bytes = total;
+}
+
+static bool TOBJ_T(stream_fail)(TOBJ_T(tobj_stream) * s, tobj_result r) {
+  if (s->err == TOBJ_OK) s->err = r;
+  return false;
+}
+
+static void TOBJ_T(stream_warn)(TOBJ_T(tobj_stream) * s, const char *msg) {
+  tobj_diag_append(s->diag, &s->alloc, TOBJ_SEV_WARNING, s->line_no, msg);
+}
+
+static bool TOBJ_T(stream_line_append)(TOBJ_T(tobj_stream) * s, uint8_t ch) {
+  if (s->line.count >= s->line_content_limit)
+    return TOBJ_T(stream_fail)(s, TOBJ_ERR_LIMIT_EXCEEDED);
+
+  size_t need;
+  if (!tobj_size_add(s->line.count, 2, &need))
+    return TOBJ_T(stream_fail)(s, TOBJ_ERR_OVERFLOW);
+
+  if (need > s->line.cap) {
+    size_t newcap = s->line.cap ? s->line.cap + s->line.cap / 2 : 256;
+    if (newcap < s->line.cap) newcap = (size_t)-1;
+    if (newcap < need) newcap = need;
+    if (newcap > s->line_capacity_limit)
+      newcap = s->line_capacity_limit;
+    if (newcap < need)
+      return TOBJ_T(stream_fail)(s, TOBJ_ERR_LIMIT_EXCEEDED);
+
+    void *p = tobj_realloc(&s->alloc, s->line.data, s->line.cap, newcap, 16);
+    if (!p) return TOBJ_T(stream_fail)(s, TOBJ_ERR_ALLOC);
+    s->line.data = p;
+    s->line.cap = newcap;
+    TOBJ_T(stream_note_peak)(s);
+  }
+
+  ((uint8_t *)s->line.data)[s->line.count++] = ch;
+  return true;
+}
+
+static bool TOBJ_T(stream_corner_push)(TOBJ_T(tobj_stream) * s,
+                                       const tobj_index *idx) {
+  if (s->corners.count >= s->caps.arity)
+    return TOBJ_T(stream_fail)(s, TOBJ_ERR_LIMIT_EXCEEDED);
+
+  size_t need;
+  if (!tobj_size_add(s->corners.count, 1, &need))
+    return TOBJ_T(stream_fail)(s, TOBJ_ERR_OVERFLOW);
+
+  if (need > s->corners.cap) {
+    size_t newcap = s->corners.cap ? s->corners.cap + s->corners.cap / 2 : 8;
+    if (newcap < s->corners.cap) newcap = (size_t)-1;
+    if (newcap < need) newcap = need;
+    if (newcap > s->caps.arity) newcap = s->caps.arity;
+    if (newcap < need)
+      return TOBJ_T(stream_fail)(s, TOBJ_ERR_LIMIT_EXCEEDED);
+
+    size_t old_bytes, new_bytes;
+    if (!tobj_size_mul(s->corners.cap, sizeof(tobj_index), &old_bytes) ||
+        !tobj_size_mul(newcap, sizeof(tobj_index), &new_bytes))
+      return TOBJ_T(stream_fail)(s, TOBJ_ERR_OVERFLOW);
+    void *p =
+        tobj_realloc(&s->alloc, s->corners.data, old_bytes, new_bytes, 16);
+    if (!p) return TOBJ_T(stream_fail)(s, TOBJ_ERR_ALLOC);
+    s->corners.data = p;
+    s->corners.cap = newcap;
+    TOBJ_T(stream_note_peak)(s);
+  }
+
+  ((tobj_index *)s->corners.data)[s->corners.count++] = *idx;
+  return true;
+}
+
+/* Trim a cursor remainder in place and NUL-terminate it. The returned pointer
+ * is valid until the current line is overwritten. */
+static char *TOBJ_T(stream_rest_nul)(tobj_cursor *c) {
+  char *p = (char *)c->p;
+  char *e = (char *)c->end;
+  while (p < e && tobj_is_space(*p)) p++;
+  while (e > p && tobj_is_space(e[-1])) e--;
+  *e = '\0';
+  return p;
+}
+
+static bool TOBJ_T(stream_index_limit)(TOBJ_T(tobj_stream) * s, size_t count) {
+  if (count > s->caps.indices ||
+      s->out_indices > s->caps.indices - count)
+    return TOBJ_T(stream_fail)(s, TOBJ_ERR_LIMIT_EXCEEDED);
+  s->out_indices += count;
+  return true;
+}
+
+static bool TOBJ_T(stream_process_line)(TOBJ_T(tobj_stream) * s) {
+  s->stats.lines++;
+  s->line_no = s->stats.lines;
+
+  char *p = (char *)s->line.data;
+  char empty = '\0';
+  if (!p) p = &empty;
+  size_t len = s->line.count;
+  if (s->stats.lines == 1) {
+    size_t bom = tobj_skip_bom((const uint8_t *)p, len);
+    p += bom;
+    len -= bom;
+  }
+  if (len > s->caps.line_bytes)
+    return TOBJ_T(stream_fail)(s, TOBJ_ERR_LIMIT_EXCEEDED);
+  if (len > s->stats.max_line_bytes) s->stats.max_line_bytes = len;
+  p[len] = '\0';
+
+  tobj_cursor c;
+  tobj_cur_init(&c, p, len);
+  const char *tok;
+  size_t tl;
+  if (!tobj_next_token(&c, &tok, &tl) || tok[0] == '#') return true;
+
+  if (tobj_slice_eq(tok, tl, "v")) {
+    double nums[8];
+    int n = 0;
+    while (n < 8) {
+      double d;
+      const char *save = c.p;
+      if (!tobj_scan_double(&c.p, c.end, &d)) {
+        c.p = save;
+        break;
+      }
+      nums[n++] = d;
+    }
+    if (n < 3) {
+      TOBJ_T(stream_warn)(s, "tinyobjc: 'v' with fewer than 3 components\n");
+      while (n < 3) nums[n++] = 0.0;
+    }
+    if (s->numv >= s->caps.vertices)
+      return TOBJ_T(stream_fail)(s, TOBJ_ERR_LIMIT_EXCEEDED);
+
+    TOBJ_REAL x = (TOBJ_REAL)nums[0];
+    TOBJ_REAL y = (TOBJ_REAL)nums[1];
+    TOBJ_REAL z = (TOBJ_REAL)nums[2];
+    TOBJ_REAL w = (n == 4) ? (TOBJ_REAL)nums[3] : (TOBJ_REAL)1;
+    bool has_color = (n >= 6);
+    TOBJ_REAL r = has_color ? (TOBJ_REAL)nums[3] : (TOBJ_REAL)1;
+    TOBJ_REAL g = has_color ? (TOBJ_REAL)nums[4] : (TOBJ_REAL)1;
+    TOBJ_REAL b = has_color ? (TOBJ_REAL)nums[5] : (TOBJ_REAL)1;
+    void *ud = s->cb.user_data;
+
+    if (s->cb.vertex_cb) s->cb.vertex_cb(ud, x, y, z, w);
+    if (s->cb.vertex_color_cb)
+      s->cb.vertex_color_cb(ud, x, y, z, r, g, b, has_color);
+    s->numv++;
+    s->stats.vertices++;
+    return s->err == TOBJ_OK;
+  }
+
+  if (tobj_slice_eq(tok, tl, "vn")) {
+    double d;
+    TOBJ_REAL xyz[3] = {0, 0, 0};
+    for (int i = 0; i < 3; i++)
+      if (tobj_scan_double(&c.p, c.end, &d)) xyz[i] = (TOBJ_REAL)d;
+    if (s->numvn >= s->caps.vertices)
+      return TOBJ_T(stream_fail)(s, TOBJ_ERR_LIMIT_EXCEEDED);
+    if (s->cb.normal_cb)
+      s->cb.normal_cb(s->cb.user_data, xyz[0], xyz[1], xyz[2]);
+    s->numvn++;
+    s->stats.normals++;
+    return s->err == TOBJ_OK;
+  }
+
+  if (tobj_slice_eq(tok, tl, "vt")) {
+    double d;
+    TOBJ_REAL uvw[3] = {0, 0, 0};
+    for (int i = 0; i < 3; i++)
+      if (tobj_scan_double(&c.p, c.end, &d)) uvw[i] = (TOBJ_REAL)d;
+    if (s->numvt >= s->caps.vertices)
+      return TOBJ_T(stream_fail)(s, TOBJ_ERR_LIMIT_EXCEEDED);
+    if (s->cb.texcoord_cb)
+      s->cb.texcoord_cb(s->cb.user_data, uvw[0], uvw[1], uvw[2]);
+    s->numvt++;
+    s->stats.texcoords++;
+    return s->err == TOBJ_OK;
+  }
+
+  if (tobj_slice_eq(tok, tl, "f") || tobj_slice_eq(tok, tl, "l") ||
+      tobj_slice_eq(tok, tl, "p")) {
+    char kind = tok[0];
+    s->corners.count = 0;
+    const char *t2;
+    size_t l2;
+    while (tobj_next_token(&c, &t2, &l2)) {
+      tobj_index idx;
+      TOBJ_T(parse_corner_n)(t2, l2, s->numv, s->numvt, s->numvn, &idx);
+      if (!TOBJ_T(stream_corner_push)(s, &idx)) return false;
+    }
+    if (s->corners.count > s->stats.max_face_arity)
+      s->stats.max_face_arity = s->corners.count;
+
+    const tobj_index *indices = (const tobj_index *)s->corners.data;
+    int num = tobj_size_to_int(s->corners.count);
+    if (kind == 'f') {
+      if (s->corners.count < 3) {
+        TOBJ_T(stream_warn)(s, "tinyobjc: degenerate face (<3 vertices)\n");
+        return true;
+      }
+      if (s->stats.faces >= s->caps.faces)
+        return TOBJ_T(stream_fail)(s, TOBJ_ERR_LIMIT_EXCEEDED);
+      if (!TOBJ_T(stream_index_limit)(s, s->corners.count)) return false;
+      s->stats.faces++;
+      if (s->cb.index_cb) s->cb.index_cb(s->cb.user_data, indices, num);
+    } else if (kind == 'l') {
+      if (s->corners.count < 2) {
+        TOBJ_T(stream_warn)(s, "tinyobjc: degenerate line (<2 vertices)\n");
+        return true;
+      }
+      if (!TOBJ_T(stream_index_limit)(s, s->corners.count)) return false;
+      if (s->cb.line_cb) s->cb.line_cb(s->cb.user_data, indices, num);
+    } else {
+      if (!TOBJ_T(stream_index_limit)(s, s->corners.count)) return false;
+      if (s->corners.count && s->cb.point_cb)
+        s->cb.point_cb(s->cb.user_data, indices, num);
+    }
+    return s->err == TOBJ_OK;
+  }
+
+  if (tobj_slice_eq(tok, tl, "g")) {
+    char *name = TOBJ_T(stream_rest_nul)(&c);
+    if (s->cb.group_cb) {
+      const char *names[1] = {name};
+      s->cb.group_cb(s->cb.user_data, names, 1);
+    }
+    return s->err == TOBJ_OK;
+  }
+
+  if (tobj_slice_eq(tok, tl, "o")) {
+    char *name = TOBJ_T(stream_rest_nul)(&c);
+    if (s->cb.object_cb) s->cb.object_cb(s->cb.user_data, name);
+    return s->err == TOBJ_OK;
+  }
+
+  if (tobj_slice_eq(tok, tl, "usemtl")) {
+    char *name = TOBJ_T(stream_rest_nul)(&c);
+    s->cur_material = -1;
+    if (s->cb.usemtl_cb)
+      s->cb.usemtl_cb(s->cb.user_data, name, s->cur_material);
+    return s->err == TOBJ_OK;
+  }
+
+  if (tobj_slice_eq(tok, tl, "s")) {
+    const char *st;
+    size_t sl;
+    if (tobj_next_token(&c, &st, &sl)) {
+      if (tobj_slice_eq(st, sl, "off")) {
+        s->cur_smooth = 0;
+      } else {
+        const char *q = st;
+        int v = 0;
+        tobj_scan_int(&q, st + sl, &v);
+        s->cur_smooth = v > 0 ? (unsigned)v : 0u;
+      }
+    }
+    return true;
+  }
+
+  /* mtllib and all other directives are intentionally ignored here. Material
+   * resolution remains available through the whole-file loaders. */
+  return true;
+}
+
+tobj_result TOBJ_T(tobj_stream_create)(
+    TOBJ_T(tobj_stream) ** out, const TOBJ_T(tobj_callbacks) * cb,
+    const tobj_load_config *cfg, tobj_diag *diag) {
+  if (!out) return TOBJ_ERR_INVALID_ARG;
+  *out = NULL;
+  if (!cb) return TOBJ_ERR_INVALID_ARG;
+
+  tobj_load_config defcfg;
+  if (!cfg) {
+    defcfg = tobj_default_config();
+    cfg = &defcfg;
+  }
+
+  tobj_allocator alloc;
+  if (!tobj_resolve_allocator(&cfg->allocator, &alloc))
+    return TOBJ_ERR_INVALID_ARG;
+
+  TOBJ_T(tobj_stream) *s =
+      (TOBJ_T(tobj_stream) *)tobj_calloc(&alloc, 1, sizeof *s, 16);
+  if (!s) return TOBJ_ERR_ALLOC;
+
+  s->alloc = alloc;
+  s->cfg = *cfg;
+  s->caps = tobj_resolve_caps(cfg);
+  s->cb = *cb;
+  s->diag = diag;
+  s->cur_material = -1;
+  tobj_vec_init(&s->line, 1);
+  tobj_vec_init(&s->corners, sizeof(tobj_index));
+
+  if (s->caps.line_bytes > (size_t)-1 - 4) {
+    s->line_content_limit = (size_t)-1;
+    s->line_capacity_limit = (size_t)-1;
+  } else {
+    s->line_content_limit = s->caps.line_bytes + 3;
+    s->line_capacity_limit = s->caps.line_bytes + 4;
+  }
+
+  *out = s;
+  return TOBJ_OK;
+}
+
+tobj_result TOBJ_T(tobj_stream_feed)(TOBJ_T(tobj_stream) * s,
+                                     const uint8_t *data, size_t len) {
+  if (!s) return TOBJ_ERR_INVALID_ARG;
+  if (s->err != TOBJ_OK) return s->err;
+  if (s->finished) return TOBJ_ERR_INVALID_ARG;
+  if (!data && len) return TOBJ_ERR_INVALID_ARG;
+  if (s->stats.input_bytes > s->caps.input_bytes ||
+      len > s->caps.input_bytes - s->stats.input_bytes)
+    return TOBJ_T(stream_fail)(s, TOBJ_ERR_LIMIT_EXCEEDED);
+  if (!len) return TOBJ_OK;
+
+  s->stats.input_bytes += len;
+  s->stats.input_chunks++;
+
+  for (size_t i = 0; i < len; i++) {
+    uint8_t ch = data[i];
+    if (s->skip_lf) {
+      s->skip_lf = false;
+      if (ch == '\n') continue;
+    }
+    if (ch == '\n' || ch == '\r') {
+      if (ch == '\r') s->skip_lf = true;
+      if (!TOBJ_T(stream_process_line)(s)) return s->err;
+      s->line.count = 0;
+    } else if (!TOBJ_T(stream_line_append)(s, ch)) {
+      return s->err;
+    }
+  }
+  return s->err;
+}
+
+tobj_result TOBJ_T(tobj_stream_finish)(TOBJ_T(tobj_stream) * s) {
+  if (!s) return TOBJ_ERR_INVALID_ARG;
+  if (s->err != TOBJ_OK) return s->err;
+  if (s->finished) return TOBJ_OK;
+
+  bool bom_only = s->stats.lines == 0 && s->line.count == 3 &&
+                  tobj_skip_bom((const uint8_t *)s->line.data, 3) == 3;
+  if (s->line.count && !bom_only && !TOBJ_T(stream_process_line)(s))
+    return s->err;
+  s->line.count = 0;
+  s->finished = true;
+  return s->err;
+}
+
+tobj_result TOBJ_T(tobj_stream_get_stats)(
+    const TOBJ_T(tobj_stream) * s, TOBJ_T(tobj_stream_stats) * out) {
+  if (!s || !out) return TOBJ_ERR_INVALID_ARG;
+  *out = s->stats;
+  return TOBJ_OK;
+}
+
+void TOBJ_T(tobj_stream_destroy)(TOBJ_T(tobj_stream) * s) {
+  if (!s) return;
+  tobj_allocator alloc = s->alloc;
+  tobj_vec_free(&s->line, &alloc);
+  tobj_vec_free(&s->corners, &alloc);
+  tobj_memset(s, 0, sizeof *s);
+  tobj_free(&alloc, s, sizeof *s);
+}

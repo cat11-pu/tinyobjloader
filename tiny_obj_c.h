@@ -239,6 +239,8 @@ typedef tobj_points_d tobj_points;
 typedef tobj_shape_d tobj_shape;
 typedef tobj_scene_d tobj_scene;
 typedef tobj_callbacks_d tobj_callbacks;
+typedef tobj_stream_d tobj_stream;
+typedef tobj_stream_stats_d tobj_stream_stats;
 typedef tobj_material_list_d tobj_material_list;
 
 #define tobj_load_obj_from_memory(...) tobj_load_obj_from_memory_d(__VA_ARGS__)
@@ -246,6 +248,11 @@ typedef tobj_material_list_d tobj_material_list;
 #define tobj_load_obj_with_callbacks(...) \
   tobj_load_obj_with_callbacks_d(__VA_ARGS__)
 #define tobj_load_obj_from_io(...) tobj_load_obj_from_io_d(__VA_ARGS__)
+#define tobj_stream_create(...) tobj_stream_create_d(__VA_ARGS__)
+#define tobj_stream_feed(...) tobj_stream_feed_d(__VA_ARGS__)
+#define tobj_stream_finish(...) tobj_stream_finish_d(__VA_ARGS__)
+#define tobj_stream_get_stats(...) tobj_stream_get_stats_d(__VA_ARGS__)
+#define tobj_stream_destroy(...) tobj_stream_destroy_d(__VA_ARGS__)
 #define tobj_scene_free(...) tobj_scene_free_d(__VA_ARGS__)
 #define tobj_parse_mtl_from_memory(...) tobj_parse_mtl_from_memory_d(__VA_ARGS__)
 #define tobj_material_list_free(...) tobj_material_list_free_d(__VA_ARGS__)
@@ -262,6 +269,8 @@ typedef tobj_points_f tobj_points;
 typedef tobj_shape_f tobj_shape;
 typedef tobj_scene_f tobj_scene;
 typedef tobj_callbacks_f tobj_callbacks;
+typedef tobj_stream_f tobj_stream;
+typedef tobj_stream_stats_f tobj_stream_stats;
 typedef tobj_material_list_f tobj_material_list;
 
 #define tobj_load_obj_from_memory(...) tobj_load_obj_from_memory_f(__VA_ARGS__)
@@ -269,6 +278,11 @@ typedef tobj_material_list_f tobj_material_list;
 #define tobj_load_obj_with_callbacks(...) \
   tobj_load_obj_with_callbacks_f(__VA_ARGS__)
 #define tobj_load_obj_from_io(...) tobj_load_obj_from_io_f(__VA_ARGS__)
+#define tobj_stream_create(...) tobj_stream_create_f(__VA_ARGS__)
+#define tobj_stream_feed(...) tobj_stream_feed_f(__VA_ARGS__)
+#define tobj_stream_finish(...) tobj_stream_finish_f(__VA_ARGS__)
+#define tobj_stream_get_stats(...) tobj_stream_get_stats_f(__VA_ARGS__)
+#define tobj_stream_destroy(...) tobj_stream_destroy_f(__VA_ARGS__)
 #define tobj_scene_free(...) tobj_scene_free_f(__VA_ARGS__)
 #define tobj_parse_mtl_from_memory(...) tobj_parse_mtl_from_memory_f(__VA_ARGS__)
 #define tobj_material_list_free(...) tobj_material_list_free_f(__VA_ARGS__)

@@ -247,6 +247,33 @@ typedef struct TOBJ_T(tobj_callbacks) {
   void *user_data;
 } TOBJ_T(tobj_callbacks);
 
+/*
+ * Incremental OBJ reader. Feed bytes in arbitrary chunks; complete lines are
+ * parsed immediately and emitted through a tobj_callbacks object. The reader
+ * retains only the current line and the current face's corners, so memory does
+ * not grow with the number of vertices or faces.
+ *
+ * Face callbacks receive the original (not triangulated) polygon corners. The
+ * event stream matches tobj_load_obj_with_callbacks_* when both are given the
+ * same complete OBJ input. String/index pointers passed to callbacks are
+ * borrowed and remain valid only for the duration of that callback.
+ * `mtllib` is not resolved; `usemtl_cb` receives material_id == -1.
+ */
+typedef struct TOBJ_T(tobj_stream) TOBJ_T(tobj_stream);
+
+typedef struct TOBJ_T(tobj_stream_stats) {
+  size_t input_bytes;      /* cumulative bytes accepted from feed() */
+  size_t input_chunks;     /* number of non-empty feed() calls */
+  size_t lines;            /* physical input lines consumed */
+  size_t vertices;         /* v records */
+  size_t normals;          /* vn records */
+  size_t texcoords;        /* vt records */
+  size_t faces;            /* f records with at least 3 corners */
+  size_t max_line_bytes;   /* longest complete line (BOM excluded) */
+  size_t max_face_arity;   /* largest f/l/p corner count seen */
+  size_t peak_buffer_bytes;/* peak line + face-scratch capacity */
+} TOBJ_T(tobj_stream_stats);
+
 /* ---- entry points ------------------------------------------------------ */
 
 TOBJ_API tobj_result TOBJ_T(tobj_load_obj_from_memory)(
@@ -266,6 +293,31 @@ TOBJ_API tobj_result TOBJ_T(tobj_load_obj_from_file)(
 TOBJ_API tobj_result TOBJ_T(tobj_load_obj_with_callbacks)(
     const uint8_t *buf, size_t len, const TOBJ_T(tobj_callbacks) * cb,
     const tobj_load_config *cfg, tobj_diag *diag);
+
+/*
+ * Create an incremental reader. `cb` and `cfg` are copied. `diag` is referenced
+ * and must outlive the stream. On success the caller owns *out and must
+ * release it with tobj_stream_destroy_*.
+ *
+ * Limits: cfg->max_input_bytes bounds cumulative input, max_line_bytes bounds
+ * the line buffer, max_face_arity bounds face/line/point scratch, and
+ * max_vertices/max_faces/max_indices bound emitted data.
+ */
+TOBJ_API tobj_result TOBJ_T(tobj_stream_create)(
+    TOBJ_T(tobj_stream) ** out, const TOBJ_T(tobj_callbacks) * cb,
+    const tobj_load_config *cfg, tobj_diag *diag);
+
+/* Feed [data, data + len). Chunks may split anywhere, including CRLF and BOM. */
+TOBJ_API tobj_result TOBJ_T(tobj_stream_feed)(
+    TOBJ_T(tobj_stream) * stream, const uint8_t *data, size_t len);
+
+/* Flush a final unterminated line. Idempotent after a successful finish. */
+TOBJ_API tobj_result TOBJ_T(tobj_stream_finish)(TOBJ_T(tobj_stream) * stream);
+
+TOBJ_API tobj_result TOBJ_T(tobj_stream_get_stats)(
+    const TOBJ_T(tobj_stream) * stream, TOBJ_T(tobj_stream_stats) * out);
+
+TOBJ_API void TOBJ_T(tobj_stream_destroy)(TOBJ_T(tobj_stream) * stream);
 
 TOBJ_API void TOBJ_T(tobj_scene_free)(TOBJ_T(tobj_scene) * scene);
 

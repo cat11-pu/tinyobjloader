@@ -468,6 +468,81 @@ with CMake (`-DTINYOBJLOADER_BUILD_C_LIBRARY=ON`, the default; options
 compile `tiny_obj_c.c` and `tobj_tess.c`. C tests live under `tests/`
 (`make check_c`).
 
+### Incremental streaming parser
+
+`tobj_stream_*` parses caller-fed chunks without retaining the complete OBJ.
+Each complete line is dispatched immediately through `tobj_callbacks_f`:
+
+```c
+static void on_vertex(void *ud, float x, float y, float z, float w) {
+  (void)ud; (void)w;
+  /* consume x/y/z now; the parser does not retain model vertices */
+  (void)x; (void)y; (void)z;
+}
+
+static void on_face(void *ud, const tobj_index *idx, int num) {
+  (void)ud;
+  /* idx[0..num-1] is borrowed until the next feed/finish call */
+  for (int i = 0; i < num; i++) {
+    int position = idx[i].vertex_index;
+    (void)position;
+  }
+}
+
+tobj_load_config cfg = tobj_default_config();
+cfg.max_line_bytes = 64 * 1024;  /* hard line-buffer cap */
+cfg.max_face_arity = 4096;       /* hard face-corner scratch cap */
+
+tobj_callbacks_f cb = {0};
+cb.vertex_cb = on_vertex;
+cb.index_cb = on_face;
+
+tobj_stream_f *stream = NULL;
+if (tobj_stream_create_f(&stream, &cb, &cfg, NULL) != TOBJ_OK) return 1;
+
+tobj_result r = TOBJ_OK;
+while (have_chunk) {
+  r = tobj_stream_feed_f(stream, chunk_data, chunk_size);
+  if (r != TOBJ_OK) break;
+}
+if (r == TOBJ_OK) r = tobj_stream_finish_f(stream);
+
+tobj_stream_stats stats;
+if (tobj_stream_get_stats_f(stream, &stats) == TOBJ_OK) {
+  /* stats.peak_buffer_bytes is the parser's line + face-scratch peak */
+}
+tobj_stream_destroy_f(stream);
+```
+
+Properties and scope:
+
+* Chunks may split anywhere: mid-token, inside UTF-8 BOM bytes, between `\r`
+  and `\n`, or at the end of an unterminated final line.
+* Geometry callbacks (`v`, `vn`, `vt`, `f`, `l`, `p`) and context callbacks
+  (`g`, `o`, `usemtl`) match the event order of
+  `tobj_load_obj_with_callbacks_*` for the same input. `s` is accepted and
+  tracked, but `tobj_callbacks` has no smoothing-group callback. Faces are
+  emitted as original polygons, not triangulated. For scene comparison, load
+  with `cfg.triangulate = false`; concatenating the streamed faces then matches
+  the scene indices.
+* `mtllib`, material IDs, and free-form geometry are not resolved by the
+  streaming reader. Use the whole-file loaders when those are required.
+* Callback string/index pointers are borrowed and valid only for the duration
+  of that callback.
+* Parser-owned memory is bounded by
+  `max_line_bytes + 4 + max_face_arity * sizeof(tobj_index)` plus a small
+  fixed reader object. It does not grow with the number of vertices or faces.
+  `max_input_bytes`, `max_vertices`, `max_faces`, and `max_indices` are also
+  enforced. Limits always fail with `TOBJ_ERR_LIMIT_EXCEEDED`; the parser never
+  silently switches to unbounded buffering.
+* `tobj_stream_get_stats_*` reports bytes/chunks/lines, record counts, longest
+  line, largest face arity, and peak line+face scratch capacity.
+
+The C test suite exercises one-byte feeds, every two-chunk split position,
+BOM/CRLF boundaries, all hard limits, 100,000 faces at fixed peak memory, and
+1,000 create/feed/finish/destroy cycles under a counting allocator plus
+ASan/UBSan.
+
 ## Python binding
 
 ```
