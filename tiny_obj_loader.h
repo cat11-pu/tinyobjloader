@@ -75,6 +75,15 @@ THE SOFTWARE.
 #include <new>
 #include <type_traits>
 
+// Large OBJ files benefit substantially from mapping the input instead of
+// copying it through an ifstream buffer.  Keep an explicit opt-out for
+// callers that cannot use mmap.
+#if !defined(_WIN32) && !defined(TINYOBJLOADER_USE_MMAP) && \
+    !defined(TINYOBJLOADER_DISABLE_MMAP) && \
+    (defined(__unix__) || defined(__APPLE__))
+#define TINYOBJLOADER_USE_MMAP 1
+#endif
+
 namespace tinyobj {
 
 // C++11 is now the minimum required standard.
@@ -10289,6 +10298,82 @@ static bool opt_parseRawTriple(const char **token, opt_index_t *ret) {
   return true;
 }
 
+static inline bool opt_parseIndexComponent(const char **cursor,
+                                           const char *end, int *value) {
+  const char *p = *cursor;
+  bool negative = false;
+  if (p < end && (*p == '+' || *p == '-')) {
+    negative = (*p == '-');
+    ++p;
+  }
+  if (p >= end || !TINYOBJ_OPT_IS_DIGIT(*p)) return false;
+
+  unsigned int magnitude = 0;
+  const unsigned int limit =
+      negative ? static_cast<unsigned int>(INT_MAX) + 1u
+               : static_cast<unsigned int>(INT_MAX);
+  bool overflow = false;
+  do {
+    const unsigned int digit = static_cast<unsigned int>(*p - '0');
+    if (!overflow) {
+      if (magnitude > limit / 10u ||
+          (magnitude == limit / 10u && digit > limit % 10u)) {
+        overflow = true;
+      } else {
+        magnitude = magnitude * 10u + digit;
+      }
+    }
+    ++p;
+  } while (p < end && TINYOBJ_OPT_IS_DIGIT(*p));
+
+  if (overflow) {
+    *value = negative ? INT_MIN : INT_MAX;
+  } else if (negative) {
+    *value = (magnitude == static_cast<unsigned int>(INT_MAX) + 1u)
+                 ? INT_MIN
+                 : -static_cast<int>(magnitude);
+  } else {
+    *value = static_cast<int>(magnitude);
+  }
+  *cursor = p;
+  return true;
+}
+
+// Parse one v/vt/vn triple directly from a face line.  Unlike the generic
+// tokenizer, this never needs a NUL-terminated temporary token.
+static inline bool opt_parseRawTripleFast(const char **token,
+                                          const char *line_end,
+                                          opt_index_t *ret) {
+  const char *p = *token;
+  if (!opt_parseIndexComponent(&p, line_end, &ret->vertex_index)) {
+    return false;
+  }
+  if (p >= line_end || *p != '/') {
+    *token = p;
+    return true;
+  }
+  ++p;
+
+  if (p < line_end && *p == '/') {
+    ++p;
+    if (!opt_parseIndexComponent(&p, line_end, &ret->normal_index)) {
+      return false;
+    }
+  } else {
+    if (!opt_parseIndexComponent(&p, line_end, &ret->texcoord_index)) {
+      return false;
+    }
+    if (p < line_end && *p == '/') {
+      ++p;
+      if (!opt_parseIndexComponent(&p, line_end, &ret->normal_index)) {
+        return false;
+      }
+    }
+  }
+  *token = p;
+  return true;
+}
+
 static inline int opt_length_until_newline(const char *token, size_t n) {
   size_t len = 0;
   for (len = 0; len < n; len++) {
@@ -10514,6 +10599,50 @@ struct OptFaceCmd {
         vt_count_before(0), degenerate(false) {}
 };
 
+static bool opt_parseFaceToCmd(OptFaceCmd *face, const char *token,
+                               const char *line_end, bool triangulate) {
+  unsigned int face_count = 0;
+  while (token < line_end) {
+    while (token < line_end && TINYOBJ_OPT_IS_SPACE(*token)) ++token;
+    if (token >= line_end || *token == '\r' || *token == '\n' ||
+        *token == '#' || *token == '\0') {
+      break;
+    }
+
+    opt_index_t vi;
+    if (!opt_parseRawTripleFast(&token, line_end, &vi)) return false;
+    if (face_count < OptFaceCmd::kInlineCap) {
+      face->f_inline[face_count] = vi;
+    } else {
+      if (face_count == OptFaceCmd::kInlineCap) {
+        face->f_heap.reserve(16);
+        for (unsigned int k = 0; k < OptFaceCmd::kInlineCap; ++k) {
+          face->f_heap.push_back(face->f_inline[k]);
+        }
+      }
+      face->f_heap.push_back(vi);
+    }
+    ++face_count;
+  }
+
+  face->face_vertex_count = face_count;
+  if (face_count < 3) {
+    face->degenerate = true;
+    face->emitted_face_count = 0;
+    face->emitted_face_verts = 0;
+    face->f_count = 0;
+  } else if (triangulate) {
+    face->emitted_face_count = face_count - 2;
+    face->emitted_face_verts = 3;
+    face->f_count = face->emitted_face_count * 3;
+  } else {
+    face->emitted_face_count = 1;
+    face->emitted_face_verts = face_count;
+    face->f_count = face_count;
+  }
+  return true;
+}
+
 // Meta command — for g, o, usemtl, mtllib, s lines
 struct OptMetaCmd {
   OptCommandType type;
@@ -10529,6 +10658,69 @@ struct OptMetaCmd {
       : type(OPT_CMD_EMPTY), source_line(0), str_ptr(NULL), str_len(0),
         group_name_empty(false), resolved_material_id(-1),
         smoothing_group_id(0) {}
+};
+
+// Open-addressed lookup for material names.  Entries point into the material
+// vector, so resolving `usemtl` does not allocate a temporary std::string.
+class OptMaterialLookup {
+ public:
+  OptMaterialLookup() : mask_(0) {}
+
+  void rebuild(const std::vector<material_t> &materials) {
+    size_t table_size = 16;
+    while (table_size < materials.size() * 2) table_size <<= 1;
+    slots_.assign(table_size, Slot());
+    mask_ = table_size - 1;
+    for (size_t i = 0; i < materials.size(); ++i) {
+      const std::string &name = materials[i].name;
+      if (name.empty()) continue;
+      // Match std::map::insert semantics: the first definition wins.
+      if (find(name.data(), name.size()) >= 0) continue;
+      const uint32_t h = hash(name.data(), name.size());
+      size_t pos = h & mask_;
+      while (slots_[pos].id >= 0) pos = (pos + 1) & mask_;
+      slots_[pos].hash = h;
+      slots_[pos].name = name.data();
+      slots_[pos].len = name.size();
+      slots_[pos].id = static_cast<int>(i);
+    }
+  }
+
+  int find(const char *name, size_t len) const {
+    if (slots_.empty()) return -1;
+    const uint32_t h = hash(name, len);
+    size_t pos = h & mask_;
+    for (;;) {
+      const Slot &slot = slots_[pos];
+      if (slot.id < 0) return -1;
+      if (slot.hash == h && slot.len == len &&
+          std::memcmp(slot.name, name, len) == 0) {
+        return slot.id;
+      }
+      pos = (pos + 1) & mask_;
+    }
+  }
+
+ private:
+  struct Slot {
+    const char *name;
+    size_t len;
+    uint32_t hash;
+    int id;
+    Slot() : name(NULL), len(0), hash(0), id(-1) {}
+  };
+
+  static uint32_t hash(const char *name, size_t len) {
+    uint32_t h = 2166136261u;
+    for (size_t i = 0; i < len; ++i) {
+      h ^= static_cast<unsigned char>(name[i]);
+      h *= 16777619u;
+    }
+    return h;
+  }
+
+  std::vector<Slot> slots_;
+  size_t mask_;
 };
 
 // Sequence entry — ordering of faces and meta commands within a thread
@@ -11307,6 +11499,27 @@ static void simd_build_line_infos(const char *buf, size_t len,
 /// Scalar fallback newline scanning — handles \n, \r\n, and bare \r
 static void scalar_find_line_infos(const char *buf, size_t start, size_t end,
                                    std::vector<LineInfo> &out) {
+  // Most OBJ files use LF (or CRLF) endings.  Use libc's vectorized memchr
+  // instead of visiting every byte in scalar code.  Bare-CR files take the
+  // general path below so mixed line endings remain byte-for-byte compatible.
+  if (std::memchr(buf + start, '\r', end - start) == NULL) {
+    size_t prev = start;
+    while (prev < end) {
+      const char *base = buf + prev;
+      const char *nl = static_cast<const char *>(
+          std::memchr(base, '\n', end - prev));
+      const size_t stop = nl ? static_cast<size_t>(nl - buf) : end;
+      if (stop > prev) {
+        LineInfo info;
+        info.pos = prev;
+        info.len = stop - prev;
+        out.push_back(info);
+      }
+      prev = nl ? stop + 1 : end;
+    }
+    return;
+  }
+
   size_t prev = start;
   for (size_t i = start; i < end; i++) {
     if (buf[i] == '\n' || buf[i] == '\r') {
@@ -11629,7 +11842,8 @@ static inline bool opt_fast_parse_float(real_t *out, const char **cursor,
 
 // Parse a single line and store into compact per-type thread data.
 // Fast path: v/vn/vt lines are parsed directly using fast_float with line_end,
-// bypassing OptCommand entirely.  Face/meta lines fall back to opt_parseLine.
+// bypassing OptCommand entirely.  Face lines use a compact dedicated parser;
+// meta lines fall back to opt_parseLine.
 static void opt_parseLineToThreadData(
     OptThreadData &td, const char *line_ptr, size_t line_len,
     bool triangulate, size_t line_number,
@@ -11638,12 +11852,11 @@ static void opt_parseLineToThreadData(
   while (*token == ' ' || *token == '\t') token++;
   if (*token == '\n' || *token == '\r' || *token == '#' || *token == '\0')
     return;
+  const char *line_end = line_ptr + line_len;
 
 #ifdef TINYOBJLOADER_DISABLE_FAST_FLOAT
   (void)cache;  // only consumed by the fast_float fast path below
 #else
-  const char *line_end = line_ptr + line_len;
-
   // ---- Fast path: vertex position (v x y z [w] [r g b]) ----
   if (token[0] == 'v' && (token[1] == ' ' || token[1] == '\t')) {
     const char *cur = token + 2;
@@ -11785,7 +11998,31 @@ static void opt_parseLineToThreadData(
   }
 #endif  // TINYOBJLOADER_DISABLE_FAST_FLOAT
 
-  // ---- Slow path: face / meta commands via opt_parseLine ----
+  // ---- Fast path: face (directly into compact OptFaceCmd) ----
+  if (token[0] == 'f' && (token[1] == ' ' || token[1] == '\t')) {
+    const char *face_token = token + 2;
+    td.faces.emplace_back();
+    OptFaceCmd &fc = td.faces.back();
+    if (!opt_parseFaceToCmd(&fc, face_token, line_end, triangulate)) {
+      td.faces.pop_back();
+      td.error_line = line_number;
+      td.error_message = "failed to parse `f' line (invalid vertex index)";
+      return;
+    }
+    fc.source_line = static_cast<uint32_t>(line_number);
+    fc.v_count_before = static_cast<uint32_t>(td.num_v);
+    fc.vn_count_before = static_cast<uint32_t>(td.num_vn);
+    fc.vt_count_before = static_cast<uint32_t>(td.num_vt);
+    td.num_f_indices += fc.f_count;
+    td.num_f_faces += fc.emitted_face_count;
+    OptSeqEntry se;
+    se.kind = OptSeqEntry::SEQ_FACE;
+    se.index = static_cast<uint32_t>(td.faces.size() - 1);
+    td.seq.push_back(se);
+    return;
+  }
+
+  // ---- Slow path: meta commands via opt_parseLine ----
   OptCommand cmd;
   bool parse_error = false;
   bool ok = opt_parseLine(&cmd, line_ptr, line_len, triangulate,
@@ -11924,6 +12161,68 @@ static void opt_parseLineToThreadData(
   }
 }
 
+// Single-threaded fused scan/parse path.  It avoids materializing a LineInfo
+// for every line and folds the legacy-token check into the same pass.
+// Returns false when the buffer needs the legacy-compatible parser.
+static bool opt_parse_single_pass(OptThreadData &td, const char *buf,
+                                  size_t len, bool triangulate,
+                                  OptFloatCache *cache,
+                                  size_t *out_total_lines) {
+  size_t total_lines = 0;
+  size_t line_number = 1;
+  size_t pos = 0;
+
+  // LF-only files are the overwhelmingly common case.  A whole-buffer memchr
+  // lets the hot loop use one vectorized search per line.
+  const bool has_cr = std::memchr(buf, '\r', len) != NULL;
+  if (!has_cr) {
+    while (pos < len) {
+      const char *nl = static_cast<const char *>(
+          std::memchr(buf + pos, '\n', len - pos));
+      const size_t stop = nl ? static_cast<size_t>(nl - buf) : len;
+      if (stop > pos) {
+        const char *line = buf + pos;
+        const size_t line_len = stop - pos;
+        if (opt_line_start_is_legacy(line, line_len)) return false;
+        opt_parseLineToThreadData(td, line, line_len, triangulate,
+                                  line_number, cache);
+        ++total_lines;
+        if (td.error_line != 0) break;
+        ++line_number;
+      }
+      pos = nl ? stop + 1 : len;
+    }
+  } else {
+    size_t prev = 0;
+    for (size_t i = 0; i < len; ++i) {
+      if (buf[i] != '\n' && buf[i] != '\r') continue;
+
+      const size_t line_len = i - prev;
+      if (line_len > 0) {
+        const char *line = buf + prev;
+        if (opt_line_start_is_legacy(line, line_len)) return false;
+        opt_parseLineToThreadData(td, line, line_len, triangulate,
+                                  line_number, cache);
+        ++total_lines;
+        if (td.error_line != 0) break;
+        ++line_number;
+      }
+      if (buf[i] == '\r' && i + 1 < len && buf[i + 1] == '\n') ++i;
+      prev = i + 1;
+    }
+    if (td.error_line == 0 && prev < len) {
+      const size_t line_len = len - prev;
+      if (opt_line_start_is_legacy(buf + prev, line_len)) return false;
+      opt_parseLineToThreadData(td, buf + prev, line_len, triangulate,
+                                line_number, cache);
+      ++total_lines;
+    }
+  }
+
+  if (out_total_lines) *out_total_lines = total_lines;
+  return true;
+}
+
 }  // namespace opt_internal
 
 // Internal implementation with optional basedir for material path resolution
@@ -11989,57 +12288,62 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
 #else
 #endif
 
-  // ---- Phase 1: find line boundaries ----
+  const size_t num_t = static_cast<size_t>(num_threads);
   std::vector<LineInfo> all_line_infos;
+  size_t total_lines = 0;
+  bool use_legacy_fallback = false;
 
+  // ---- Phase 1: find line boundaries (multi-threaded path only) ----
+  if (num_t > 1) {
 #if defined(TINYOBJLOADER_USE_SIMD) && \
     (defined(TINYOBJLOADER_SIMD_SSE2) || defined(TINYOBJLOADER_SIMD_AVX2) || \
      defined(TINYOBJLOADER_SIMD_NEON))
-  {
-    std::vector<size_t> nl_positions;
-    nl_positions.reserve(work_len / 64);
-    simd_find_newlines(work_buf, work_len, nl_positions);
-    simd_build_line_infos(work_buf, work_len, nl_positions, all_line_infos);
-  }
-#else
-  {
-    all_line_infos.reserve(work_len / 64);
-    scalar_find_line_infos(work_buf, 0, work_len, all_line_infos);
-  }
-#endif
-
-  const size_t total_lines = all_line_infos.size();
-  if (total_lines == 0) return true;
-
-  // Fast buffer-level check for legacy-only tokens (replaces per-line scan)
-  if (opt_buffer_requires_legacy_fallback(work_buf, work_len)) {
-    std::string input(buf, buf + buf_len);
-    std::istringstream iss(input);
-    attrib_t legacy_attrib;
-    std::vector<shape_t> legacy_shapes;
-    std::vector<material_t> legacy_materials;
-    MaterialFileReader mat_reader(mtl_basedir);
-    MaterialReader *reader =
-        enable_mtllib_loading ? static_cast<MaterialReader *>(&mat_reader) : NULL;
-    const bool ok = LoadObj(&legacy_attrib, &legacy_shapes, &legacy_materials,
-                            warn, err, &iss, reader, config.triangulate, false);
-    if (!ok) {
-      return false;
+    {
+      std::vector<size_t> nl_positions;
+      nl_positions.reserve(work_len / 64);
+      simd_find_newlines(work_buf, work_len, nl_positions);
+      simd_build_line_infos(work_buf, work_len, nl_positions, all_line_infos);
     }
-    ConvertLegacyResultToBasic(legacy_attrib, legacy_shapes, legacy_materials,
-                               attrib, shapes, materials);
-    return true;
+#else
+    {
+      all_line_infos.reserve(work_len / 64);
+      scalar_find_line_infos(work_buf, 0, work_len, all_line_infos);
+    }
+#endif
+    total_lines = all_line_infos.size();
+    use_legacy_fallback =
+        opt_buffer_requires_legacy_fallback(work_buf, work_len);
   }
 
   // ---- Phase 2: parse lines (compact storage) ----
-  //   Single-threaded or multi-threaded depending on compile option.
-
-  const size_t num_t = static_cast<size_t>(num_threads);
+  //   Single-threaded parsing fuses line scanning and parsing in one pass.
   std::vector<OptThreadData> thread_data(num_t);
+
+  auto parse_single_threaded = [&]() {
+    OptThreadData &td = thread_data[0];
+    const size_t est_lines = work_len / 32;
+    const size_t est_faces = work_len / 128;
+    td.v_pos.reserve(est_lines);
+    td.vn_data.reserve(est_lines);
+    td.vt_data.reserve(est_lines);
+    td.faces.reserve(est_faces);
+    td.seq.reserve(est_faces);
+    OptFloatCache *tc = nullptr;
+#ifndef TINYOBJLOADER_DISABLE_FAST_FLOAT
+    OptFloatCache thread_cache(config.float_cache_max_nodes,
+                               config.fp32_cache);
+    if (config.float_cache) tc = &thread_cache;
+#endif
+    if (!use_legacy_fallback) {
+      use_legacy_fallback =
+          !opt_parse_single_pass(td, work_buf, work_len, config.triangulate,
+                                 tc, &total_lines);
+    }
+  };
 
 #ifdef TINYOBJLOADER_USE_MULTITHREADING
   // Multi-threaded path
-  {
+  if (num_t > 1) {
     size_t lines_per_thread = total_lines / num_t;
     std::vector<std::thread> workers;
     workers.reserve(num_t);
@@ -12071,29 +12375,33 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
       });
     }
     for (auto &w : workers) w.join();
+  } else {
+    parse_single_threaded();
   }
 
 #else
   // Single-threaded path
-  {
-    OptThreadData &td = thread_data[0];
-    td.v_pos.reserve(total_lines * 2);
-    td.faces.reserve(total_lines / 3);
-    td.seq.reserve(total_lines / 3);
-    OptFloatCache *tc = nullptr;
-#ifndef TINYOBJLOADER_DISABLE_FAST_FLOAT
-    OptFloatCache thread_cache(config.float_cache_max_nodes,
-                               config.fp32_cache);
-    if (config.float_cache) tc = &thread_cache;
+  parse_single_threaded();
 #endif
-    for (size_t i = 0; i < total_lines; i++) {
-      opt_parseLineToThreadData(td, &work_buf[all_line_infos[i].pos],
-                                 all_line_infos[i].len, config.triangulate,
-                                 i + 1, tc);
-      if (td.error_line != 0) break;
-    }
+
+  if (use_legacy_fallback) {
+    std::string input(buf, buf + buf_len);
+    std::istringstream iss(input);
+    attrib_t legacy_attrib;
+    std::vector<shape_t> legacy_shapes;
+    std::vector<material_t> legacy_materials;
+    MaterialFileReader mat_reader(mtl_basedir);
+    MaterialReader *reader =
+        enable_mtllib_loading ? static_cast<MaterialReader *>(&mat_reader) : NULL;
+    const bool ok = LoadObj(&legacy_attrib, &legacy_shapes, &legacy_materials,
+                            warn, err, &iss, reader, config.triangulate, false);
+    if (!ok) return false;
+    ConvertLegacyResultToBasic(legacy_attrib, legacy_shapes, legacy_materials,
+                               attrib, shapes, materials);
+    return true;
   }
-#endif
+
+  if (total_lines == 0) return true;
 
   size_t first_error_line = 0;
   std::string first_error_message;
@@ -12123,6 +12431,7 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
   {
     MaterialFileReader mat_file_reader(mtl_basedir);
     std::set<std::string> material_filenames;
+    OptMaterialLookup material_lookup;
     std::vector<material_t> temp_materials;
     std::vector<material_t> *material_dst = materials ? materials : &temp_materials;
     int running_material_id = -1;
@@ -12271,6 +12580,7 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
             if (ok) {
               found = true;
               material_filenames.insert(filenames[s]);
+              material_lookup.rebuild(*material_dst);
               break;
             }
           }
@@ -12285,22 +12595,27 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
         }
 
         if (meta.type == OPT_CMD_USEMTL) {
-          std::string mat_name;
-          if (meta.str_ptr && meta.str_len > 0) {
-            mat_name.assign(meta.str_ptr, meta.str_len);
-          }
-          while (!mat_name.empty() &&
-                 (mat_name.back() == '\r' || mat_name.back() == '\n')) {
-            mat_name.pop_back();
+          const char *mat_name = meta.str_ptr;
+          size_t mat_name_len = meta.str_len;
+          while (mat_name_len > 0 &&
+                 (mat_name[mat_name_len - 1] == '\r' ||
+                  mat_name[mat_name_len - 1] == '\n')) {
+            --mat_name_len;
           }
 
-          std::map<std::string, int>::const_iterator it = material_map.find(mat_name);
-          if (it != material_map.end()) {
-            meta.resolved_material_id = it->second;
+          const int material_id =
+              mat_name ? material_lookup.find(mat_name, mat_name_len) : -1;
+          if (material_id >= 0) {
+            meta.resolved_material_id = material_id;
           } else {
             meta.resolved_material_id = -1;
             if (warn) {
-              (*warn) += "material [ '" + mat_name + "' ] not found in .mtl\n";
+              std::string missing_name;
+              if (mat_name && mat_name_len > 0) {
+                missing_name.assign(mat_name, mat_name_len);
+              }
+              (*warn) +=
+                  "material [ '" + missing_name + "' ] not found in .mtl\n";
             }
           }
           running_material_id = meta.resolved_material_id;
@@ -12363,11 +12678,34 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
     return false;
   }
 
-  attrib->vertices.resize(num_v * 3);
-  attrib->vertex_weights.resize(num_v, real_t(1.0));
-  attrib->normals.resize(num_vn * 3);
-  attrib->texcoords.resize(num_vt * 2);
-  attrib->texcoord_ws.resize(num_vt, real_t(0.0));
+  const bool single_thread = (num_t == 1);
+  if (single_thread) {
+    OptThreadData &td = thread_data[0];
+    attrib->vertices.swap(td.v_pos);
+    if (td.saw_any_weight) {
+      attrib->vertex_weights.swap(td.v_weight);
+    } else {
+      attrib->vertex_weights.resize(num_v, real_t(1.0));
+    }
+    attrib->normals.swap(td.vn_data);
+    attrib->texcoords.swap(td.vt_data);
+    if (td.saw_any_texcoord_w) {
+      attrib->texcoord_ws.swap(td.vt_w);
+    } else {
+      attrib->texcoord_ws.resize(num_vt, real_t(0.0));
+    }
+    if (td.saw_any_color && !td.saw_missing_color) {
+      attrib->colors.swap(td.v_color);
+    } else {
+      attrib->colors.clear();
+    }
+  } else {
+    attrib->vertices.resize(num_v * 3);
+    attrib->vertex_weights.resize(num_v, real_t(1.0));
+    attrib->normals.resize(num_vn * 3);
+    attrib->texcoords.resize(num_vt * 2);
+    attrib->texcoord_ws.resize(num_vt, real_t(0.0));
+  }
   std::vector<unsigned int> all_smoothing_group_ids(
       static_cast<size_t>(total_faces), 0);
   attrib->indices.resize(total_idx);
@@ -12375,7 +12713,15 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
   attrib->material_ids.resize(static_cast<size_t>(total_faces), -1);
   std::vector<unsigned char> thread_saw_any_vertex_color(num_t, 0);
   std::vector<unsigned char> thread_missing_vertex_color(num_t, 0);
-  std::vector<real_t> all_colors(num_v * 3, real_t(1.0));
+  std::vector<real_t> all_colors;
+  if (!single_thread) {
+    for (size_t t = 0; t < num_t; ++t) {
+      if (thread_data[t].saw_any_color) {
+        all_colors.assign(num_v * 3, real_t(1.0));
+        break;
+      }
+    }
+  }
 
   // Compute per-thread offsets
   std::vector<size_t> v_off(num_t), n_off(num_t), t_off(num_t), f_off(num_t),
@@ -12459,6 +12805,10 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
     int greatest_vn_idx = -1;
     int greatest_vt_idx = -1;
 
+    // Reuse one scratch buffer instead of allocating a vector for every face.
+    index_t resolved_inline[8];
+    std::vector<index_t> resolved_heap;
+
     for (size_t si = 0; si < td.seq.size(); si++) {
       const OptSeqEntry &entry = td.seq[si];
       if (entry.kind == OptSeqEntry::SEQ_META) {
@@ -12480,7 +12830,13 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
       size_t nc = n_off[t] + face.vn_count_before;
       size_t tc = t_off[t] + face.vt_count_before;
 
-      std::vector<index_t> resolved_face(face.face_vertex_count);
+      index_t *resolved_face;
+      if (face.face_vertex_count <= 8) {
+        resolved_face = resolved_inline;
+      } else {
+        resolved_heap.resize(face.face_vertex_count);
+        resolved_face = resolved_heap.data();
+      }
       for (size_t k = 0; k < face.face_vertex_count; k++) {
         const opt_index_t &vi = face.face_indices()[k];
         index_t idx;
@@ -12528,14 +12884,21 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
       size_t written_index_count = 0;
       size_t written_face_count = 0;
       if (config.triangulate) {
-        written_index_count = opt_triangulate_face(
-            attrib->vertices, resolved_face.data(), resolved_face.size(),
-            &attrib->indices[fc]);
+        if (face.face_vertex_count == 3) {
+          attrib->indices[fc] = resolved_face[0];
+          attrib->indices[fc + 1] = resolved_face[1];
+          attrib->indices[fc + 2] = resolved_face[2];
+          written_index_count = 3;
+        } else {
+          written_index_count = opt_triangulate_face(
+              attrib->vertices, resolved_face, face.face_vertex_count,
+              &attrib->indices[fc]);
+        }
         written_face_count = written_index_count / 3;
       } else {
-        written_index_count = resolved_face.size();
+        written_index_count = face.face_vertex_count;
         written_face_count = 1;
-        for (size_t k = 0; k < resolved_face.size(); k++) {
+        for (size_t k = 0; k < face.face_vertex_count; k++) {
           attrib->indices[fc + k] = resolved_face[k];
         }
       }
@@ -12572,11 +12935,9 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
     }
     for (auto &w : workers) w.join();
   } else {
-    for (size_t t = 0; t < num_t; t++) merge_vertex_thread(t);
     for (size_t t = 0; t < num_t; t++) merge_thread(t);
   }
 #else
-  for (size_t t = 0; t < num_t; t++) merge_vertex_thread(t);
   for (size_t t = 0; t < num_t; t++) merge_thread(t);
 #endif
 
@@ -12627,7 +12988,9 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
         saw_missing_vertex_color || (thread_missing_vertex_color[t] != 0);
   }
 
-  if (saw_any_vertex_color && !saw_missing_vertex_color) {
+  if (single_thread) {
+    // The parser's contiguous color buffer was already moved into place.
+  } else if (saw_any_vertex_color && !saw_missing_vertex_color) {
     attrib->colors.swap(all_colors);
   } else {
     attrib->colors.clear();
@@ -12687,7 +13050,7 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
       static_cast<int>(attrib->vertices.size() / 3),
       static_cast<int>(attrib->normals.size() / 3),
       static_cast<int>(attrib->texcoords.size() / 2),
-      all_line_infos.size() + 1);
+      total_lines + 1);
   for (size_t deg = 0; deg < eof_pending_degenerate_faces; deg++) {
     if (warn) {
       (*warn) += "Degenerated face found\n.";
@@ -12965,33 +13328,99 @@ static bool LoadObjOptTyped_internal(OptResult *result,
 #else
 #endif
 
-  // ---- Phase 1: find line boundaries ----
+  const size_t num_t = static_cast<size_t>(num_threads);
   std::vector<LineInfo> all_line_infos;
+  size_t total_lines = 0;
+  bool use_legacy_fallback = false;
 
+  // ---- Phase 1: find line boundaries (multi-threaded path only) ----
+  if (num_t > 1) {
 #if defined(TINYOBJLOADER_USE_SIMD) && \
     (defined(TINYOBJLOADER_SIMD_SSE2) || defined(TINYOBJLOADER_SIMD_AVX2) || \
      defined(TINYOBJLOADER_SIMD_NEON))
-  {
-    std::vector<size_t> nl_positions;
-    nl_positions.reserve(work_len / 64);
-    simd_find_newlines(work_buf, work_len, nl_positions);
-    simd_build_line_infos(work_buf, work_len, nl_positions, all_line_infos);
+    {
+      std::vector<size_t> nl_positions;
+      nl_positions.reserve(work_len / 64);
+      simd_find_newlines(work_buf, work_len, nl_positions);
+      simd_build_line_infos(work_buf, work_len, nl_positions, all_line_infos);
+    }
+#else
+    {
+      all_line_infos.reserve(work_len / 64);
+      scalar_find_line_infos(work_buf, 0, work_len, all_line_infos);
+    }
+#endif
+    total_lines = all_line_infos.size();
+    use_legacy_fallback =
+        opt_buffer_requires_legacy_fallback(work_buf, work_len);
+  }
+
+  // ---- Phase 2: parse lines (compact storage) ----
+  std::vector<OptThreadData> thread_data(num_t);
+
+  auto parse_single_threaded = [&]() {
+    OptThreadData &td = thread_data[0];
+    const size_t est_lines = work_len / 32;
+    const size_t est_faces = work_len / 128;
+    td.v_pos.reserve(est_lines);
+    td.vn_data.reserve(est_lines);
+    td.vt_data.reserve(est_lines);
+    td.faces.reserve(est_faces);
+    td.seq.reserve(est_faces);
+    OptFloatCache *tc = nullptr;
+#ifndef TINYOBJLOADER_DISABLE_FAST_FLOAT
+    OptFloatCache thread_cache(config.float_cache_max_nodes,
+                               config.fp32_cache);
+    if (config.float_cache) tc = &thread_cache;
+#endif
+    if (!use_legacy_fallback) {
+      use_legacy_fallback =
+          !opt_parse_single_pass(td, work_buf, work_len, config.triangulate,
+                                 tc, &total_lines);
+    }
+  };
+
+#ifdef TINYOBJLOADER_USE_MULTITHREADING
+  if (num_t > 1) {
+    size_t lines_per_thread = total_lines / num_t;
+    std::vector<std::thread> workers;
+    workers.reserve(num_t);
+
+    for (int t = 0; t < num_threads; t++) {
+      size_t start = static_cast<size_t>(t) * lines_per_thread;
+      size_t end = (t == num_threads - 1)
+                       ? total_lines
+                       : (static_cast<size_t>(t) + 1) * lines_per_thread;
+
+      workers.emplace_back([&, t, start, end]() {
+        OptThreadData &td = thread_data[static_cast<size_t>(t)];
+        size_t est_lines = end - start;
+        td.v_pos.reserve(est_lines * 2);
+        td.faces.reserve(est_lines / 3);
+        td.seq.reserve(est_lines / 3);
+        OptFloatCache *tc = nullptr;
+#ifndef TINYOBJLOADER_DISABLE_FAST_FLOAT
+        OptFloatCache thread_cache(config.float_cache_max_nodes,
+                                   config.fp32_cache);
+        if (config.float_cache) tc = &thread_cache;
+#endif
+        for (size_t i = start; i < end; i++) {
+          opt_parseLineToThreadData(td, &work_buf[all_line_infos[i].pos],
+                                     all_line_infos[i].len, config.triangulate,
+                                     i + 1, tc);
+          if (td.error_line != 0) break;
+        }
+      });
+    }
+    for (auto &w : workers) w.join();
+  } else {
+    parse_single_threaded();
   }
 #else
-  {
-    all_line_infos.reserve(work_len / 64);
-    scalar_find_line_infos(work_buf, 0, work_len, all_line_infos);
-  }
+  parse_single_threaded();
 #endif
 
-  const size_t total_lines = all_line_infos.size();
-  if (total_lines == 0) {
-    result->valid = true;
-    return true;
-  }
-
-  // Fast buffer-level check for legacy-only tokens (replaces per-line scan)
-  if (opt_buffer_requires_legacy_fallback(work_buf, work_len)) {
+  if (use_legacy_fallback) {
     basic_attrib_t<> tmp_attrib;
     std::vector<basic_shape_t<>> tmp_shapes;
     std::vector<material_t> tmp_materials;
@@ -13062,64 +13491,10 @@ static bool LoadObjOptTyped_internal(OptResult *result,
     return true;
   }
 
-  // ---- Phase 2: parse lines (compact storage) ----
-  const size_t num_t = static_cast<size_t>(num_threads);
-  std::vector<OptThreadData> thread_data(num_t);
-
-#ifdef TINYOBJLOADER_USE_MULTITHREADING
-  {
-    size_t lines_per_thread = total_lines / num_t;
-    std::vector<std::thread> workers;
-    workers.reserve(num_t);
-
-    for (int t = 0; t < num_threads; t++) {
-      size_t start = static_cast<size_t>(t) * lines_per_thread;
-      size_t end = (t == num_threads - 1)
-                       ? total_lines
-                       : (static_cast<size_t>(t) + 1) * lines_per_thread;
-
-      workers.emplace_back([&, t, start, end]() {
-        OptThreadData &td = thread_data[static_cast<size_t>(t)];
-        size_t est_lines = end - start;
-        td.v_pos.reserve(est_lines * 2);
-        td.faces.reserve(est_lines / 3);
-        td.seq.reserve(est_lines / 3);
-        OptFloatCache *tc = nullptr;
-#ifndef TINYOBJLOADER_DISABLE_FAST_FLOAT
-        OptFloatCache thread_cache(config.float_cache_max_nodes,
-                                   config.fp32_cache);
-        if (config.float_cache) tc = &thread_cache;
-#endif
-        for (size_t i = start; i < end; i++) {
-          opt_parseLineToThreadData(td, &work_buf[all_line_infos[i].pos],
-                                     all_line_infos[i].len, config.triangulate,
-                                     i + 1, tc);
-          if (td.error_line != 0) break;
-        }
-      });
-    }
-    for (auto &w : workers) w.join();
+  if (total_lines == 0) {
+    result->valid = true;
+    return true;
   }
-#else
-  {
-    OptThreadData &td = thread_data[0];
-    td.v_pos.reserve(total_lines * 2);
-    td.faces.reserve(total_lines / 3);
-    td.seq.reserve(total_lines / 3);
-    OptFloatCache *tc = nullptr;
-#ifndef TINYOBJLOADER_DISABLE_FAST_FLOAT
-    OptFloatCache thread_cache(config.float_cache_max_nodes,
-                               config.fp32_cache);
-    if (config.float_cache) tc = &thread_cache;
-#endif
-    for (size_t i = 0; i < total_lines; i++) {
-      opt_parseLineToThreadData(td, &work_buf[all_line_infos[i].pos],
-                                 all_line_infos[i].len, config.triangulate,
-                                 i + 1, tc);
-      if (td.error_line != 0) break;
-    }
-  }
-#endif
 
   // Check for parse errors
   size_t first_error_line = 0;
@@ -13150,6 +13525,7 @@ static bool LoadObjOptTyped_internal(OptResult *result,
   {
     MaterialFileReader mat_file_reader(mtl_basedir);
     std::set<std::string> material_filenames;
+    OptMaterialLookup material_lookup;
     std::vector<material_t> *material_dst = &result->materials;
     int running_material_id = -1;
     size_t pending_degenerate_faces = 0;
@@ -13259,6 +13635,7 @@ static bool LoadObjOptTyped_internal(OptResult *result,
             if (ok) {
               found = true;
               material_filenames.insert(filenames[s]);
+              material_lookup.rebuild(*material_dst);
               break;
             }
           }
@@ -13269,20 +13646,27 @@ static bool LoadObjOptTyped_internal(OptResult *result,
         }
 
         if (meta.type == OPT_CMD_USEMTL) {
-          std::string mat_name;
-          if (meta.str_ptr && meta.str_len > 0) {
-            mat_name.assign(meta.str_ptr, meta.str_len);
+          const char *mat_name = meta.str_ptr;
+          size_t mat_name_len = meta.str_len;
+          while (mat_name_len > 0 &&
+                 (mat_name[mat_name_len - 1] == '\r' ||
+                  mat_name[mat_name_len - 1] == '\n')) {
+            --mat_name_len;
           }
-          while (!mat_name.empty() &&
-                 (mat_name.back() == '\r' || mat_name.back() == '\n')) {
-            mat_name.pop_back();
-          }
-          std::map<std::string, int>::const_iterator it = material_map.find(mat_name);
-          if (it != material_map.end()) {
-            meta.resolved_material_id = it->second;
+          const int material_id =
+              mat_name ? material_lookup.find(mat_name, mat_name_len) : -1;
+          if (material_id >= 0) {
+            meta.resolved_material_id = material_id;
           } else {
             meta.resolved_material_id = -1;
-            if (warn) (*warn) += "material [ '" + mat_name + "' ] not found in .mtl\n";
+            if (warn) {
+              std::string missing_name;
+              if (mat_name && mat_name_len > 0) {
+                missing_name.assign(mat_name, mat_name_len);
+              }
+              (*warn) +=
+                  "material [ '" + missing_name + "' ] not found in .mtl\n";
+            }
           }
           running_material_id = meta.resolved_material_id;
           continue;
@@ -13687,7 +14071,7 @@ static bool LoadObjOptTyped_internal(OptResult *result,
       static_cast<int>(attrib.vertices.size() / 3),
       static_cast<int>(attrib.normals.size() / 3),
       static_cast<int>(attrib.texcoords.size() / 2),
-      all_line_infos.size() + 1);
+      total_lines + 1);
   for (size_t deg = 0; deg < eof_pending_degenerate_faces; deg++) {
     if (warn) (*warn) += "Degenerated face found\n.";
   }

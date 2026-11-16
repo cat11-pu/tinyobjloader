@@ -398,6 +398,9 @@ arrays (vertex weights, texcoord `w`, colors, ...) when the input contains
 them — handy when minimizing allocations matters. An experimental stream-based
 loader lives under `experimental/stream/`.
 
+On POSIX platforms the file entry points memory-map the input automatically;
+define `TINYOBJLOADER_DISABLE_MMAP` to force the `ifstream` path instead.
+
 ## Pure C11 loader (`tiny_obj_c`)
 
 For C projects (and freestanding / embedded use) the repository ships a
