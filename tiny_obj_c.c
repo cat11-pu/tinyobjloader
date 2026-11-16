@@ -525,7 +525,7 @@ static bool tobj_scan_double(const char **pp, const char *end, double *out) {
   return true;
 }
 
-/* Parse a (possibly signed) integer token (saturating to int range). */
+/* Parse a (possibly signed) integer token.  Returns false on overflow. */
 static bool tobj_scan_int(const char **pp, const char *end, int *out) {
   tobj_skip_space(pp, end);
   const char *p = *pp;
@@ -536,20 +536,27 @@ static bool tobj_scan_int(const char **pp, const char *end, int *out) {
     p++;
   }
   if (p >= end || !tobj_is_digit(*p)) return false;
+  const long long limit = (sign < 0) ? 2147483648LL : 2147483647LL;
   long long v = 0;
-  bool sat = false;
+  bool overflow = false;
   while (p < end && tobj_is_digit(*p)) {
-    if (!sat) {
-      v = v * 10 + (*p - '0');
-      if (v > 2147483647LL) {
-        v = 2147483647LL;
-        sat = true;
+    if (!overflow) {
+      const int digit = (int)(*p - '0');
+      if (v > (limit - digit) / 10LL) {
+        overflow = true;
+      } else {
+        v = v * 10 + digit;
       }
     }
     p++;
   }
-  *out = (int)(sign < 0 ? -v : v);
   *pp = p;
+  if (overflow) return false;
+  if (sign < 0 && v == 2147483648LL) {
+    *out = (-2147483647 - 1);
+    return true;
+  }
+  *out = (int)(sign < 0 ? -v : v);
   return true;
 }
 
@@ -652,8 +659,9 @@ static bool tobj_next_token(tobj_cursor *c, const char **tok, size_t *tok_len) {
 /* [10] diagnostics, config, result strings (precision-independent)        */
 /* ======================================================================= */
 
-/* Append a fixed message to the diag sink. `msg` is NUL-terminated; no
- * formatting is performed (freestanding-safe). */
+/* Append a fixed message to the diag sink.  The callback receives line_no
+ * separately; aggregated buffers get a "line N: " prefix so callers always
+ * have a source location for malformed input. */
 static void tobj_diag_append(tobj_diag *d, const tobj_allocator *a,
                              tobj_severity sev, size_t line_no,
                              const char *msg) {
@@ -662,26 +670,47 @@ static void tobj_diag_append(tobj_diag *d, const tobj_allocator *a,
     d->on_message(d->user_data, sev, line_no, msg, tobj_strlen(msg));
     return;
   }
+  char line_buf[32];
+  size_t line_len = 0;
+  if (line_no > 0) {
+    char digits[24];
+    size_t nd = 0;
+    size_t v = line_no;
+    do {
+      digits[nd++] = (char)('0' + (v % 10u));
+      v /= 10u;
+    } while (v && nd < sizeof digits);
+    const char prefix[] = "line ";
+    for (size_t i = 0; i < sizeof prefix - 1; i++) line_buf[line_len++] = prefix[i];
+    while (nd > 0 && line_len + 2 < sizeof line_buf)
+      line_buf[line_len++] = digits[--nd];
+    line_buf[line_len++] = ':';
+    line_buf[line_len++] = ' ';
+  }
   char **buf = (sev == TOBJ_SEV_ERROR) ? &d->err : &d->warn;
   size_t *blen = (sev == TOBJ_SEV_ERROR) ? &d->err_len : &d->warn_len;
-  size_t add = tobj_strlen(msg);
+  const size_t msg_len = tobj_strlen(msg);
+  size_t add;
   size_t old = *blen;
   size_t need;
+  if (!tobj_size_add(msg_len, line_len, &add)) return;
   if (!tobj_size_add(old, add, &need)) return;
   if (!tobj_size_add(need, 1, &need)) return;
   char *p = (char *)tobj_realloc(a, *buf, old ? old + 1 : 0, need, 1);
   if (!p) return;
-  tobj_memcpy(p + old, msg, add);
-  p[old + add] = '\0';
+  tobj_memcpy(p + old, line_buf, line_len);
+  old += line_len;
+  tobj_memcpy(p + old, msg, msg_len);
+  p[old + msg_len] = '\0';
   *buf = p;
-  *blen = old + add;
+  *blen = old + msg_len;
 }
 
 void tobj_diag_free(tobj_diag *diag, const tobj_allocator *alloc) {
   if (!diag) return;
 #ifndef TOBJ_NO_LIBC
   tobj_allocator def = tobj_default_allocator();
-  if (!alloc) alloc = &def;
+  if (!alloc || !alloc->free) alloc = &def;
 #else
   if (!alloc) return; /* cannot free without an allocator */
 #endif
@@ -744,7 +773,7 @@ static tobj_caps tobj_resolve_caps(const tobj_load_config *cfg) {
   c.vertices = cfg->max_vertices ? cfg->max_vertices : big;
   c.indices = cfg->max_indices ? cfg->max_indices : big;
   c.faces = cfg->max_faces ? cfg->max_faces : big;
-  c.arity = cfg->max_face_arity ? cfg->max_face_arity : (size_t)(1u << 20);
+  c.arity = cfg->max_face_arity ? cfg->max_face_arity : (size_t)65535u;
   c.materials = cfg->max_materials ? cfg->max_materials : (size_t)(1u << 24);
   c.shapes = cfg->max_shapes ? cfg->max_shapes : (size_t)(1u << 24);
   c.line_bytes = cfg->max_line_bytes ? cfg->max_line_bytes : (size_t)(1u << 24);
@@ -996,6 +1025,11 @@ static void tobj_run_parallel(tobj_thunk *thunks, int n) {
 /* ======================================================================= */
 
 #include "tobj_tess.h"
+
+typedef struct tobj_index_use {
+  int index;
+  size_t line;
+} tobj_index_use;
 
 #define TOBJ_REAL float
 #define TOBJ_SUF _f

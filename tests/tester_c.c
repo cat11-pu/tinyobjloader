@@ -205,13 +205,20 @@ static void test_lines_and_points(void) {
   tobj_scene_free_f(&sc);
 }
 
-static void test_degenerate_face_skipped(void) {
+static void test_degenerate_face_rejected(void) {
   tobj_scene_f sc;
-  const char *obj = "v 0 0 0\nv 1 0 0\nf 1 2\nf 1 2 1\n"; /* <3 verts skipped */
-  load_string_f(obj, &sc, true);
-  /* the 2-vertex face is skipped; the 3-"vertex" one is kept */
-  TEST_CHECK(sc.num_shapes == 1);
+  const char *obj = "v 0 0 0\nv 1 0 0\nf 1 2\nf 1 2 1\n";
+  tobj_load_config cfg = tobj_default_config();
+  tobj_diag diag;
+  memset(&diag, 0, sizeof diag);
+  tobj_result r = tobj_load_obj_from_memory_f(
+      &sc, (const uint8_t *)obj, strlen(obj), &cfg, &diag);
+  TEST_CHECK(r == TOBJ_ERR_PARSE);
+  TEST_CHECK(diag.err != NULL);
+  TEST_CHECK(strstr(diag.err, "line 3:") != NULL);
+  TEST_CHECK(sc.num_shapes == 0);
   tobj_scene_free_f(&sc);
+  tobj_diag_free(&diag, &cfg.allocator);
 }
 
 static void test_empty_and_garbage(void) {
@@ -222,7 +229,7 @@ static void test_empty_and_garbage(void) {
   tobj_scene_free_f(&sc);
   const char *garbage = "\x00\x01\x02 random !!! f f f\n v v v\n 99999999999";
   TEST_CHECK(tobj_load_obj_from_memory_f(&sc, (const uint8_t *)garbage, 40,
-                                         &cfg, NULL) == TOBJ_OK);
+                                         &cfg, NULL) == TOBJ_ERR_PARSE);
   tobj_scene_free_f(&sc);
 }
 
@@ -391,7 +398,7 @@ TEST_LIST = {
     {"vertex_colors", test_vertex_colors},
     {"color_fallback_white", test_color_fallback_white},
     {"lines_and_points", test_lines_and_points},
-    {"degenerate_face_skipped", test_degenerate_face_skipped},
+    {"degenerate_face_rejected", test_degenerate_face_rejected},
     {"empty_and_garbage", test_empty_and_garbage},
     {"mtl_standalone", test_mtl_standalone},
     {"io_callbacks", test_io_callbacks},

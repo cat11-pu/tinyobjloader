@@ -81,6 +81,11 @@ struct ParsedChunk {
   std::string err;
 };
 
+struct IndexUse {
+  int index;
+  size_t line;
+};
+
 static std::string Trim(const std::string &s) {
   size_t begin = 0;
   while (begin < s.size() &&
@@ -410,25 +415,24 @@ static bool ParseRawTripleToken(const std::string &token, RawIndex *out) {
 
   if (second == std::string::npos) {
     std::string vt_str = token.substr(first + 1);
-    if (!vt_str.empty()) {
-      out->has_texcoord_index = true;
-      if (!ParseIntToken(vt_str, &out->texcoord_index)) return false;
-    }
+    if (vt_str.empty()) return false;
+    out->has_texcoord_index = true;
+    if (!ParseIntToken(vt_str, &out->texcoord_index)) return false;
     return true;
   }
 
   std::string vt_str = token.substr(first + 1, second - first - 1);
   std::string vn_str = token.substr(second + 1);
 
+  if (vt_str.empty() && vn_str.empty()) return false;
   if (!vt_str.empty()) {
     out->has_texcoord_index = true;
     if (!ParseIntToken(vt_str, &out->texcoord_index)) return false;
   }
 
-  if (!vn_str.empty()) {
-    out->has_normal_index = true;
-    if (!ParseIntToken(vn_str, &out->normal_index)) return false;
-  }
+  if (vn_str.empty()) return false;
+  out->has_normal_index = true;
+  if (!ParseIntToken(vn_str, &out->normal_index)) return false;
 
   return true;
 }
@@ -804,10 +808,13 @@ static bool ParseLineToEvent(size_t line_num, const std::string &line,
     const size_t extra = tokens.size() - 3;
     if (extra == 1) {
       real_t w = real_t(1.0);
-      if (ParseRealToken(tokens[3], &w)) {
-        event.has_vertex_weight = true;
-        event.vertex_weight = w;
+      if (!ParseRealToken(tokens[3], &w)) {
+        chunk->err = "line " + std::to_string(line_num) +
+                     ": malformed vertex record\n";
+        return false;
       }
+      event.has_vertex_weight = true;
+      event.vertex_weight = w;
     } else if (extra == 3) {
       real_t cr = real_t(1.0), cg = real_t(1.0), cb = real_t(1.0);
       if (ParseRealToken(tokens[3], &cr) && ParseRealToken(tokens[4], &cg) &&
@@ -818,6 +825,10 @@ static bool ParseLineToEvent(size_t line_num, const std::string &line,
         event.r = cr;
         event.g = cg;
         event.b = cb;
+      } else {
+        chunk->err = "line " + std::to_string(line_num) +
+                     ": malformed vertex record\n";
+        return false;
       }
     } else if (extra >= 4) {
       real_t w = real_t(1.0), cr = real_t(1.0), cg = real_t(1.0),
@@ -830,7 +841,15 @@ static bool ParseLineToEvent(size_t line_num, const std::string &line,
         event.r = cr;
         event.g = cg;
         event.b = cb;
+      } else {
+        chunk->err = "line " + std::to_string(line_num) +
+                     ": malformed vertex record\n";
+        return false;
       }
+    } else if (extra != 0) {
+      chunk->err = "line " + std::to_string(line_num) +
+                   ": malformed vertex record\n";
+      return false;
     }
 
     chunk->events.push_back(event);
@@ -901,6 +920,11 @@ static bool ParseLineToEvent(size_t line_num, const std::string &line,
       if (!tok.empty() && tok[0] == '#') {
         break;
       }
+      if (event.face.size() >= 65535u) {
+        chunk->err = "line " + std::to_string(line_num) +
+                     ": face vertex count exceeds limit\n";
+        return false;
+      }
       RawIndex idx;
       if (!ParseRawTripleToken(tok, &idx)) {
         chunk->err = "line " + std::to_string(line_num) +
@@ -908,6 +932,11 @@ static bool ParseLineToEvent(size_t line_num, const std::string &line,
         return false;
       }
       event.face.push_back(idx);
+    }
+    if (event.face.size() < 3) {
+      chunk->err = "line " + std::to_string(line_num) +
+                   ": malformed face record\n";
+      return false;
     }
     chunk->events.push_back(event);
     return true;
@@ -984,6 +1013,9 @@ static bool ReplayChunk(const ParsedChunk &chunk, StreamHandler *handler,
                         int *num_texcoords, int *greatest_v_idx,
                         int *greatest_vn_idx, int *greatest_vt_idx,
                         std::vector<real_t> *vertex_positions,
+                        std::vector<IndexUse> *v_uses,
+                        std::vector<IndexUse> *vt_uses,
+                        std::vector<IndexUse> *vn_uses,
                         const std::string &source_name,
                         const StreamLoadConfig &config) {
   for (size_t i = 0; i < chunk.events.size(); i++) {
@@ -1027,6 +1059,8 @@ static bool ReplayChunk(const ParsedChunk &chunk, StreamHandler *handler,
               return false;
             }
             UpdateGreatestIndex(face[k].vertex_index, greatest_v_idx);
+            v_uses->push_back(
+                IndexUse{face[k].vertex_index, event.line_num});
 
             if (event.face[k].has_texcoord_index) {
               if (!ResolveIndexLikeLegacy(event.face[k].texcoord_index,
@@ -1041,6 +1075,8 @@ static bool ReplayChunk(const ParsedChunk &chunk, StreamHandler *handler,
               }
               if (face[k].texcoord_index >= 0) {
                 UpdateGreatestIndex(face[k].texcoord_index, greatest_vt_idx);
+                vt_uses->push_back(
+                    IndexUse{face[k].texcoord_index, event.line_num});
               }
             } else {
               face[k].texcoord_index = -1;
@@ -1059,6 +1095,8 @@ static bool ReplayChunk(const ParsedChunk &chunk, StreamHandler *handler,
               }
               if (face[k].normal_index >= 0) {
                 UpdateGreatestIndex(face[k].normal_index, greatest_vn_idx);
+                vn_uses->push_back(
+                    IndexUse{face[k].normal_index, event.line_num});
               }
             } else {
               face[k].normal_index = -1;
@@ -1125,6 +1163,9 @@ bool ParseObjStream(std::istream *input, StreamHandler *handler,
   int greatest_vn_idx = -1;
   int greatest_vt_idx = -1;
   std::vector<real_t> vertex_positions;
+  std::vector<IndexUse> v_uses;
+  std::vector<IndexUse> vt_uses;
+  std::vector<IndexUse> vn_uses;
 
   int num_threads = config.num_threads;
   if (num_threads < 1) {
@@ -1203,6 +1244,7 @@ bool ParseObjStream(std::istream *input, StreamHandler *handler,
       if (!ReplayChunk(chunks[c], handler, warn, err, &num_vertices,
                        &num_normals, &num_texcoords, &greatest_v_idx,
                        &greatest_vn_idx, &greatest_vt_idx, &vertex_positions,
+                       &v_uses, &vt_uses, &vn_uses,
                        source_name, config)) {
         return false;
       }
@@ -1216,9 +1258,25 @@ bool ParseObjStream(std::istream *input, StreamHandler *handler,
     }
   }
 
-  AppendOutOfBoundsWarnings(warn, greatest_v_idx, greatest_vn_idx,
-                            greatest_vt_idx, num_vertices, num_normals,
-                            num_texcoords, line_num + 1);
+  size_t first_oob_line = 0;
+  const char *oob_message = NULL;
+  for (size_t i = 0; i < v_uses.size(); i++) {
+    if (v_uses[i].index >= num_vertices &&
+        (first_oob_line == 0 || v_uses[i].line < first_oob_line)) {
+      first_oob_line = v_uses[i].line;
+      oob_message = "vertex index out of bounds";
+    }
+  }
+  if (first_oob_line != 0) {
+    if (err) {
+      (*err) += "line " + std::to_string(first_oob_line) + ": " +
+                oob_message + "\n";
+    }
+    return false;
+  }
+  AppendOutOfBoundsWarnings(warn, -1, greatest_vn_idx, greatest_vt_idx,
+                            num_vertices, num_normals, num_texcoords,
+                            line_num + 1);
   return true;
 }
 

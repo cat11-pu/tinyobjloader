@@ -919,12 +919,12 @@ void test_loadobjopt_faces_only_input() {
   bool ok = tinyobj::LoadObjOpt(&attrib, &shapes, &materials, &warn, &err,
                                 obj_text.c_str(), obj_text.size(), config);
 
-  TEST_CHECK(ok == true);
-  TEST_CHECK(err.empty());
+  TEST_CHECK(ok == false);
+  TEST_CHECK(err.find("vertex index out of bounds") != std::string::npos);
   TEST_CHECK(attrib.vertices.empty());
-  TEST_CHECK(attrib.indices.size() == 128 * 3);
-  TEST_CHECK(attrib.face_num_verts.size() == 128);
-  TEST_CHECK(!shapes.empty());
+  TEST_CHECK(attrib.indices.empty());
+  TEST_CHECK(attrib.face_num_verts.empty());
+  TEST_CHECK(shapes.empty());
 }
 
 void test_loadobjopt_synthetic_benchmark() {
@@ -1382,14 +1382,10 @@ void test_loadobjopt_invalid_polygon_matches_legacy() {
                                     &opt_warn, &opt_err, obj_text.c_str(),
                                     obj_text.size(), config);
 
-  TEST_CHECK(opt_ok == true);
-  TEST_CHECK(opt_err.empty());
-  TEST_CHECK(opt_attrib.face_num_verts.size() == opt_attrib.material_ids.size());
-  size_t total_face_indices = 0;
-  for (size_t i = 0; i < opt_attrib.face_num_verts.size(); i++) {
-    total_face_indices += static_cast<size_t>(opt_attrib.face_num_verts[i]);
-  }
-  TEST_CHECK(total_face_indices == opt_attrib.indices.size());
+  TEST_CHECK(opt_ok == false);
+  TEST_CHECK(opt_err.find("vertex index out of bounds") != std::string::npos);
+  TEST_CHECK(opt_attrib.face_num_verts.empty());
+  TEST_CHECK(opt_attrib.indices.empty());
   for (size_t i = 0; i < opt_shapes.size(); i++) {
     TEST_CHECK(opt_shapes[i].mesh.num_face_vertices.size() ==
                opt_shapes[i].mesh.material_ids.size());
@@ -1970,18 +1966,10 @@ void test_stream_loader_optional_vertex_token_matches_legacy() {
       &stream_attrib, &stream_shapes, &stream_materials, &stream_warn,
       &stream_err, &stream, NULL, config);
 
-  TEST_CHECK(legacy_ok == true);
-  TEST_CHECK(stream_ok == true);
-  TEST_CHECK(legacy_warn == stream_warn);
-  TEST_CHECK(legacy_err == stream_err);
-  TEST_CHECK(legacy_attrib.vertices == stream_attrib.vertices);
-  TEST_CHECK(legacy_attrib.vertex_weights == stream_attrib.vertex_weights);
-  TEST_CHECK(legacy_attrib.colors == stream_attrib.colors);
-  TEST_CHECK(legacy_shapes.size() == stream_shapes.size());
-  TEST_CHECK(legacy_shapes[0].mesh.indices.size() ==
-             stream_shapes[0].mesh.indices.size());
-  TEST_CHECK(legacy_shapes[0].mesh.num_face_vertices ==
-             stream_shapes[0].mesh.num_face_vertices);
+  TEST_CHECK(legacy_ok == false);
+  TEST_CHECK(stream_ok == false);
+  TEST_CHECK(legacy_err.find("expected number") != std::string::npos);
+  TEST_CHECK(stream_err.find("malformed vertex") != std::string::npos);
 }
 
 void test_loadobjopt_buffer_ignores_mtllib_like_legacy_stream() {
@@ -2479,12 +2467,12 @@ void test_stream_loader_embedded_nul_empty_shape_matches_legacy() {
       &stream_attrib, &stream_shapes, &stream_materials, &stream_warn,
       &stream_err, &stream, NULL, config);
 
-  TEST_CHECK(legacy_ok == true);
-  TEST_CHECK(stream_ok == true);
-  TEST_CHECK(legacy_shapes.size() == stream_shapes.size());
-  TEST_CHECK(legacy_shapes[0].name == stream_shapes[0].name);
-  TEST_CHECK(legacy_shapes[0].mesh.indices.size() ==
-             stream_shapes[0].mesh.indices.size());
+  TEST_CHECK(legacy_ok == false);
+  TEST_CHECK(stream_ok == false);
+  TEST_CHECK(legacy_err.find(":6:") != std::string::npos);
+  TEST_CHECK(stream_err.find("line 6:") != std::string::npos);
+  TEST_CHECK(legacy_shapes.empty());
+  TEST_CHECK(stream_shapes.empty());
 }
 
 void test_stream_loader_object_only_matches_legacy() {
@@ -2566,26 +2554,12 @@ void test_stream_loader_degenerate_face_matches_legacy() {
       &stream_attrib, &stream_shapes, &stream_materials, &stream_warn,
       &stream_err, &stream, NULL, config);
 
-  TEST_CHECK(legacy_ok == true);
-  TEST_CHECK(stream_ok == true);
-  TEST_CHECK(legacy_warn == stream_warn);
-  TEST_CHECK(legacy_err == stream_err);
-  TEST_CHECK(legacy_shapes.size() == stream_shapes.size());
-  if (legacy_shapes.size() == stream_shapes.size() && !legacy_shapes.empty()) {
-    TEST_CHECK(legacy_shapes[0].name == stream_shapes[0].name);
-    TEST_CHECK(legacy_shapes[0].mesh.num_face_vertices ==
-               stream_shapes[0].mesh.num_face_vertices);
-    TEST_CHECK(legacy_shapes[0].mesh.material_ids ==
-               stream_shapes[0].mesh.material_ids);
-    TEST_CHECK(legacy_shapes[0].mesh.smoothing_group_ids ==
-               stream_shapes[0].mesh.smoothing_group_ids);
-    TEST_CHECK(legacy_shapes[0].mesh.indices.size() ==
-               stream_shapes[0].mesh.indices.size());
-    for (size_t i = 0; i < legacy_shapes[0].mesh.indices.size(); i++) {
-      TEST_CHECK(opt_test::IndexEquals(legacy_shapes[0].mesh.indices[i],
-                                       stream_shapes[0].mesh.indices[i]));
-    }
-  }
+  TEST_CHECK(legacy_ok == false);
+  TEST_CHECK(stream_ok == false);
+  TEST_CHECK(legacy_err.find("at least 3 vertices") != std::string::npos);
+  TEST_CHECK(stream_err.find("malformed face record") != std::string::npos);
+  TEST_CHECK(legacy_shapes.empty());
+  TEST_CHECK(stream_shapes.empty());
 }
 
 void test_loadobjopt_degenerate_face_matches_legacy() {
@@ -2611,13 +2585,12 @@ void test_loadobjopt_degenerate_face_matches_legacy() {
                                     &opt_warn, &opt_err, obj_text.c_str(),
                                     obj_text.size(), config);
 
-  TEST_CHECK(legacy_ok == true);
-  TEST_CHECK(opt_ok == true);
-  TEST_CHECK(legacy_warn == opt_warn);
-  TEST_CHECK(legacy_err == opt_err);
-  TEST_CHECK(opt_test::LegacyAttribEqualsOpt(legacy_attrib, legacy_shapes,
-                                             opt_attrib));
-  TEST_CHECK(opt_test::LegacyShapesEqualOpt(legacy_shapes, opt_shapes));
+  TEST_CHECK(legacy_ok == false);
+  TEST_CHECK(opt_ok == false);
+  TEST_CHECK(legacy_err.find("at least 3 vertices") != std::string::npos);
+  TEST_CHECK(opt_err.find("at least 3 vertices") != std::string::npos);
+  TEST_CHECK(legacy_shapes.empty());
+  TEST_CHECK(opt_shapes.empty());
 }
 
 void test_stream_loader_degenerate_face_warning_order_matches_legacy() {
@@ -2643,10 +2616,10 @@ void test_stream_loader_degenerate_face_warning_order_matches_legacy() {
       &stream_attrib, &stream_shapes, &stream_materials, &stream_warn,
       &stream_err, &stream, NULL, config);
 
-  TEST_CHECK(legacy_ok == true);
-  TEST_CHECK(stream_ok == true);
-  TEST_CHECK(legacy_warn == stream_warn);
-  TEST_CHECK(legacy_err == stream_err);
+  TEST_CHECK(legacy_ok == false);
+  TEST_CHECK(stream_ok == false);
+  TEST_CHECK(legacy_err.find("at least 3 vertices") != std::string::npos);
+  TEST_CHECK(stream_err.find("malformed face record") != std::string::npos);
 }
 
 void test_stream_loader_degenerate_face_warning_suppressed_on_parse_error() {
@@ -2701,9 +2674,10 @@ void test_loadobjopt_degenerate_face_warning_order_matches_legacy() {
                                     &opt_warn, &opt_err, obj_text.c_str(),
                                     obj_text.size(), config);
 
-  TEST_CHECK(legacy_ok == true);
-  TEST_CHECK(opt_ok == true);
-  TEST_CHECK(legacy_warn == opt_warn);
+  TEST_CHECK(legacy_ok == false);
+  TEST_CHECK(opt_ok == false);
+  TEST_CHECK(legacy_err.find("at least 3 vertices") != std::string::npos);
+  TEST_CHECK(opt_err.find("at least 3 vertices") != std::string::npos);
 }
 
 void test_loadobjopt_degenerate_face_warning_suppressed_on_parse_error() {
@@ -2904,10 +2878,10 @@ void test_loadobjopt_out_of_bounds_warning_matches_legacy() {
                                     &opt_warn, &opt_err, obj_text.c_str(),
                                     obj_text.size(), config);
 
-  TEST_CHECK(legacy_ok == true);
-  TEST_CHECK(opt_ok == true);
-  TEST_CHECK(legacy_warn == opt_warn);
-  TEST_CHECK(legacy_err == opt_err);
+  TEST_CHECK(legacy_ok == false);
+  TEST_CHECK(opt_ok == false);
+  TEST_CHECK(legacy_err.find("out of bounds") != std::string::npos);
+  TEST_CHECK(opt_err.find("out of bounds") != std::string::npos);
 }
 
 void test_stream_loader_out_of_bounds_warning_matches_legacy() {
@@ -2932,10 +2906,10 @@ void test_stream_loader_out_of_bounds_warning_matches_legacy() {
       &stream_attrib, &stream_shapes, &stream_materials, &stream_warn,
       &stream_err, &stream, NULL, config);
 
-  TEST_CHECK(legacy_ok == true);
-  TEST_CHECK(stream_ok == true);
-  TEST_CHECK(legacy_warn == stream_warn);
-  TEST_CHECK(legacy_err == stream_err);
+  TEST_CHECK(legacy_ok == false);
+  TEST_CHECK(stream_ok == false);
+  TEST_CHECK(legacy_err.find("out of bounds") != std::string::npos);
+  TEST_CHECK(stream_err.find("out of bounds") != std::string::npos);
 }
 
 void test_loadobjopt_zero_vertex_index_warning_matches_legacy() {

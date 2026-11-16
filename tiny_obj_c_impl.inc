@@ -50,6 +50,9 @@ typedef struct TOBJ_T(tobj_builder) {
   tobj_vec l_idx;    /* tobj_index */
   tobj_vec l_cnt;    /* int per-line counts */
   tobj_vec p_idx;    /* tobj_index */
+  tobj_vec oob_v;    /* tobj_index_use, possible forward/OOB v refs */
+  tobj_vec oob_vt;   /* tobj_index_use */
+  tobj_vec oob_vn;   /* tobj_index_use */
 
   /* per-face scratch (reused) */
   tobj_vec corners;  /* tobj_index */
@@ -108,6 +111,13 @@ static void TOBJ_T(b_warn)(TOBJ_T(tobj_builder) * b, const char *msg) {
   tobj_diag_append(b->diag, b->alloc, TOBJ_SEV_WARNING, b->line, msg);
 }
 
+static bool TOBJ_T(b_error)(TOBJ_T(tobj_builder) * b, tobj_result e,
+                            const char *msg) {
+  if (b->err == TOBJ_OK) b->err = e;
+  tobj_diag_append(b->diag, b->alloc, TOBJ_SEV_ERROR, b->line, msg);
+  return false;
+}
+
 /* ----------------------------------------------------------------------- */
 /* index fixup (1-based -> 0-based, negative -> relative)                  */
 /* ----------------------------------------------------------------------- */
@@ -122,7 +132,7 @@ static bool TOBJ_T(fix_index)(int idx, size_t n, int *out) {
     return false; /* zero index: invalid per spec */
   }
   long long r = (long long)n + idx;
-  if (r < 0) {
+  if (r < 0 || r > 2147483647LL) {
     *out = -1;
     return false;
   }
@@ -144,30 +154,68 @@ static bool TOBJ_T(parse_corner_n)(const char *tok, size_t len, size_t numv,
   int vi;
   if (!tobj_scan_int(&c.p, c.end, &vi)) return false;
   bool ok = TOBJ_T(fix_index)(vi, numv, &out->vertex_index);
-  if (c.p < c.end && *c.p == '/') {
+  if (c.p < c.end) {
+    if (*c.p != '/') return false;
     c.p++;
+    if (c.p >= c.end) return false;
     if (c.p < c.end && *c.p != '/') {
       int ti;
-      if (tobj_scan_int(&c.p, c.end, &ti))
-        TOBJ_T(fix_index)(ti, numvt, &out->texcoord_index);
+      if (!tobj_scan_int(&c.p, c.end, &ti)) return false;
+      TOBJ_T(fix_index)(ti, numvt, &out->texcoord_index);
     }
-    if (c.p < c.end && *c.p == '/') {
+    if (c.p < c.end) {
+      if (*c.p != '/') return false;
       c.p++;
       int ni;
-      if (tobj_scan_int(&c.p, c.end, &ni))
-        TOBJ_T(fix_index)(ni, numvn, &out->normal_index);
+      if (!tobj_scan_int(&c.p, c.end, &ni)) return false;
+      TOBJ_T(fix_index)(ni, numvn, &out->normal_index);
     }
+  }
+  return ok && c.p == c.end;
+}
+
+/* Parse one face/line/point corner using the builder's current counts. */
+static bool TOBJ_T(parse_corner)(TOBJ_T(tobj_builder) * b, const char *tok,
+                                 size_t len, tobj_index *out) {
+  bool ok = TOBJ_T(parse_corner_n)(tok, len, TOBJ_T(cnt_v)(b),
+                                   TOBJ_T(cnt_vt)(b), TOBJ_T(cnt_vn)(b), out);
+  if (!ok) {
+    TOBJ_T(b_error)(b, TOBJ_ERR_PARSE,
+                    "tinyobjc: invalid or out-of-range vertex index\n");
   }
   return ok;
 }
 
-/* Parse one face/line/point corner using the builder's current counts. */
-static void TOBJ_T(parse_corner)(TOBJ_T(tobj_builder) * b, const char *tok,
-                                 size_t len, tobj_index *out) {
-  bool ok = TOBJ_T(parse_corner_n)(tok, len, TOBJ_T(cnt_v)(b),
-                                   TOBJ_T(cnt_vt)(b), TOBJ_T(cnt_vn)(b), out);
-  if (!ok && out->vertex_index < 0)
-    TOBJ_T(b_warn)(b, "tinyobjc: invalid vertex index in face\n");
+/* Remember a positive reference that is not yet backed by a parsed vertex.
+ * Forward references are legal as long as a later record creates the target;
+ * validate_index_uses() checks that after the whole file has been read. */
+static bool TOBJ_T(record_index_use)(TOBJ_T(tobj_builder) * b, tobj_vec *uses,
+                                     int index, size_t count) {
+  if (index < 0 || (size_t)index < count) return true;
+  tobj_index_use use;
+  use.index = index;
+  use.line = b->line;
+  if (!tobj_vec_append(uses, &use, 1, b->alloc))
+    return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
+  return true;
+}
+
+static size_t TOBJ_T(first_oob_line)(const tobj_vec *uses, size_t count) {
+  const tobj_index_use *p = (const tobj_index_use *)uses->data;
+  size_t first = 0;
+  for (size_t i = 0; i < uses->count; i++) {
+    if ((size_t)p[i].index >= count && (first == 0 || p[i].line < first))
+      first = p[i].line;
+  }
+  return first;
+}
+
+static bool TOBJ_T(validate_index_uses)(TOBJ_T(tobj_builder) * b) {
+  size_t lv = TOBJ_T(first_oob_line)(&b->oob_v, TOBJ_T(cnt_v)(b));
+  if (!lv) return true;
+  b->line = lv;
+  return TOBJ_T(b_error)(b, TOBJ_ERR_PARSE,
+                         "tinyobjc: vertex index out of bounds\n");
 }
 
 /* ----------------------------------------------------------------------- */
@@ -203,10 +251,15 @@ static bool TOBJ_T(handle_v)(TOBJ_T(tobj_builder) * b, tobj_cursor *c) {
     nums[n++] = d;
   }
   if (n < 3) {
-    TOBJ_T(b_warn)(b, "tinyobjc: 'v' with fewer than 3 components\n");
-    while (n < 3) nums[n++] = 0.0;
+    return TOBJ_T(b_error)(
+        b, TOBJ_ERR_PARSE,
+        "tinyobjc: 'v' record requires at least 3 components\n");
   }
-  if (b->av.count / 3u >= b->caps.vertices) return TOBJ_T(b_fail)(b, TOBJ_ERR_LIMIT_EXCEEDED);
+  if (b->av.count / 3u >= b->caps.vertices) {
+    return TOBJ_T(b_error)(
+        b, TOBJ_ERR_LIMIT_EXCEEDED,
+        "tinyobjc: vertex count exceeds configured limit\n");
+  }
   size_t vidx = b->av.count / 3u;
   TOBJ_REAL xyz[3] = {(TOBJ_REAL)nums[0], (TOBJ_REAL)nums[1], (TOBJ_REAL)nums[2]};
   if (!tobj_vec_append(&b->av, xyz, 3, b->alloc)) return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
@@ -236,8 +289,14 @@ static bool TOBJ_T(handle_v)(TOBJ_T(tobj_builder) * b, tobj_cursor *c) {
 static bool TOBJ_T(handle_vn)(TOBJ_T(tobj_builder) * b, tobj_cursor *c) {
   TOBJ_REAL xyz[3] = {0, 0, 0};
   double d;
-  for (int i = 0; i < 3; i++)
-    if (tobj_scan_double(&c->p, c->end, &d)) xyz[i] = (TOBJ_REAL)d;
+  for (int i = 0; i < 3; i++) {
+    if (!tobj_scan_double(&c->p, c->end, &d)) {
+      return TOBJ_T(b_error)(
+          b, TOBJ_ERR_PARSE,
+          "tinyobjc: 'vn' record requires 3 components\n");
+    }
+    xyz[i] = (TOBJ_REAL)d;
+  }
   if (!tobj_vec_append(&b->avn, xyz, 3, b->alloc)) return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
   return true;
 }
@@ -249,6 +308,11 @@ static bool TOBJ_T(handle_vt)(TOBJ_T(tobj_builder) * b, tobj_cursor *c) {
   for (; n < 2; n++) {
     if (!tobj_scan_double(&c->p, c->end, &d)) break;
     uv[n] = (TOBJ_REAL)d;
+  }
+  if (n < 1) {
+    return TOBJ_T(b_error)(
+        b, TOBJ_ERR_PARSE,
+        "tinyobjc: 'vt' record requires at least 1 component\n");
   }
   size_t tidx = b->avt.count / 2u;
   if (!tobj_vec_append(&b->avt, uv, 2, b->alloc)) return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
@@ -265,9 +329,26 @@ static bool TOBJ_T(emit_face)(TOBJ_T(tobj_builder) * b, size_t arity) {
   const tobj_index *corners = (const tobj_index *)b->corners.data;
   bool do_tri = b->triangulate && arity > 3u;
 
+  {
+    const size_t nv = TOBJ_T(cnt_v)(b);
+    const size_t nvt = TOBJ_T(cnt_vt)(b);
+    const size_t nvn = TOBJ_T(cnt_vn)(b);
+    for (size_t k = 0; k < arity; k++) {
+      if (!TOBJ_T(record_index_use)(b, &b->oob_v, corners[k].vertex_index, nv) ||
+          !TOBJ_T(record_index_use)(b, &b->oob_vt, corners[k].texcoord_index,
+                                    nvt) ||
+          !TOBJ_T(record_index_use)(b, &b->oob_vn, corners[k].normal_index,
+                                    nvn)) {
+        return false;
+      }
+    }
+  }
+
   if (!do_tri) {
     if (b->m_idx.count + arity > b->caps.indices)
-      return TOBJ_T(b_fail)(b, TOBJ_ERR_LIMIT_EXCEEDED);
+      return TOBJ_T(b_error)(
+          b, TOBJ_ERR_LIMIT_EXCEEDED,
+          "tinyobjc: index count exceeds configured limit\n");
     if (!tobj_vec_append(&b->m_idx, corners, arity, b->alloc))
       return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
     unsigned fv = (unsigned)tobj_size_to_int(arity);
@@ -335,7 +416,9 @@ static bool TOBJ_T(emit_face)(TOBJ_T(tobj_builder) * b, size_t arity) {
   }
 
   if (b->m_idx.count + (size_t)ntri * 3u > b->caps.indices)
-    return TOBJ_T(b_fail)(b, TOBJ_ERR_LIMIT_EXCEEDED);
+    return TOBJ_T(b_error)(
+        b, TOBJ_ERR_LIMIT_EXCEEDED,
+        "tinyobjc: index count exceeds configured limit\n");
   for (uint32_t t = 0; t < ntri; t++) {
     tobj_index tidx[3];
     tidx[0] = corners[tri[3 * t + 0]];
@@ -358,17 +441,27 @@ static bool TOBJ_T(handle_f)(TOBJ_T(tobj_builder) * b, tobj_cursor *c) {
   size_t tlen;
   size_t arity = 0;
   while (tobj_next_token(c, &tok, &tlen)) {
-    if (arity >= b->caps.arity) return TOBJ_T(b_fail)(b, TOBJ_ERR_LIMIT_EXCEEDED);
+    if (tok[0] == '#') break;
+    if (arity >= b->caps.arity) {
+      return TOBJ_T(b_error)(
+          b, TOBJ_ERR_LIMIT_EXCEEDED,
+          "tinyobjc: face vertex count exceeds configured limit\n");
+    }
     tobj_index *slot = (tobj_index *)tobj_vec_push(&b->corners, b->alloc);
     if (!slot) return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
-    TOBJ_T(parse_corner)(b, tok, tlen, slot);
+    if (!TOBJ_T(parse_corner)(b, tok, tlen, slot)) return false;
     arity++;
   }
   if (arity < 3) {
-    TOBJ_T(b_warn)(b, "tinyobjc: degenerate face (<3 vertices)\n");
-    return true;
+    return TOBJ_T(b_error)(
+        b, TOBJ_ERR_PARSE,
+        "tinyobjc: 'f' record requires at least 3 vertices\n");
   }
-  if (b->m_fv.count >= b->caps.faces) return TOBJ_T(b_fail)(b, TOBJ_ERR_LIMIT_EXCEEDED);
+  if (b->m_fv.count >= b->caps.faces) {
+    return TOBJ_T(b_error)(
+        b, TOBJ_ERR_LIMIT_EXCEEDED,
+        "tinyobjc: face count exceeds configured limit\n");
+  }
   return TOBJ_T(emit_face)(b, arity);
 }
 
@@ -378,17 +471,31 @@ static bool TOBJ_T(handle_l)(TOBJ_T(tobj_builder) * b, tobj_cursor *c) {
   size_t cnt = 0;
   size_t start = b->l_idx.count;
   while (tobj_next_token(c, &tok, &tlen)) {
-    if (cnt >= b->caps.arity) return TOBJ_T(b_fail)(b, TOBJ_ERR_LIMIT_EXCEEDED);
+    if (tok[0] == '#') break;
+    if (cnt >= b->caps.arity) {
+      return TOBJ_T(b_error)(
+          b, TOBJ_ERR_LIMIT_EXCEEDED,
+          "tinyobjc: line vertex count exceeds configured limit\n");
+    }
     tobj_index idx;
-    TOBJ_T(parse_corner)(b, tok, tlen, &idx);
+    if (!TOBJ_T(parse_corner)(b, tok, tlen, &idx)) return false;
+    if (!TOBJ_T(record_index_use)(b, &b->oob_v, idx.vertex_index,
+                                  TOBJ_T(cnt_v)(b)) ||
+        !TOBJ_T(record_index_use)(b, &b->oob_vt, idx.texcoord_index,
+                                  TOBJ_T(cnt_vt)(b)) ||
+        !TOBJ_T(record_index_use)(b, &b->oob_vn, idx.normal_index,
+                                  TOBJ_T(cnt_vn)(b))) {
+      return false;
+    }
     if (!tobj_vec_append(&b->l_idx, &idx, 1, b->alloc))
       return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
     cnt++;
   }
   if (cnt < 2) {
     b->l_idx.count = start; /* roll back */
-    TOBJ_T(b_warn)(b, "tinyobjc: degenerate line (<2 vertices)\n");
-    return true;
+    return TOBJ_T(b_error)(
+        b, TOBJ_ERR_PARSE,
+        "tinyobjc: 'l' record requires at least 2 vertices\n");
   }
   int icnt = tobj_size_to_int(cnt);
   if (!tobj_vec_append(&b->l_cnt, &icnt, 1, b->alloc))
@@ -400,12 +507,33 @@ static bool TOBJ_T(handle_l)(TOBJ_T(tobj_builder) * b, tobj_cursor *c) {
 static bool TOBJ_T(handle_p)(TOBJ_T(tobj_builder) * b, tobj_cursor *c) {
   const char *tok;
   size_t tlen;
+  size_t cnt = 0;
   while (tobj_next_token(c, &tok, &tlen)) {
+    if (tok[0] == '#') break;
+    if (cnt >= b->caps.arity) {
+      return TOBJ_T(b_error)(
+          b, TOBJ_ERR_LIMIT_EXCEEDED,
+          "tinyobjc: point vertex count exceeds configured limit\n");
+    }
     tobj_index idx;
-    TOBJ_T(parse_corner)(b, tok, tlen, &idx);
+    if (!TOBJ_T(parse_corner)(b, tok, tlen, &idx)) return false;
+    if (!TOBJ_T(record_index_use)(b, &b->oob_v, idx.vertex_index,
+                                  TOBJ_T(cnt_v)(b)) ||
+        !TOBJ_T(record_index_use)(b, &b->oob_vt, idx.texcoord_index,
+                                  TOBJ_T(cnt_vt)(b)) ||
+        !TOBJ_T(record_index_use)(b, &b->oob_vn, idx.normal_index,
+                                  TOBJ_T(cnt_vn)(b))) {
+      return false;
+    }
     if (!tobj_vec_append(&b->p_idx, &idx, 1, b->alloc))
       return TOBJ_T(b_fail)(b, TOBJ_ERR_ALLOC);
+    cnt++;
     b->cur_has_prims = true;
+  }
+  if (cnt < 1) {
+    return TOBJ_T(b_error)(
+        b, TOBJ_ERR_PARSE,
+        "tinyobjc: 'p' record requires at least 1 vertex\n");
   }
   return true;
 }
@@ -433,7 +561,11 @@ static bool TOBJ_T(finalize_shape)(TOBJ_T(tobj_builder) * b) {
     /* nothing to emit, but keep the name for the next group */
     return true;
   }
-  if (b->shapes.count >= b->caps.shapes) return TOBJ_T(b_fail)(b, TOBJ_ERR_LIMIT_EXCEEDED);
+  if (b->shapes.count >= b->caps.shapes) {
+    return TOBJ_T(b_error)(
+        b, TOBJ_ERR_LIMIT_EXCEEDED,
+        "tinyobjc: shape count exceeds configured limit\n");
+  }
 
   TOBJ_T(tobj_shape) sh;
   tobj_memset(&sh, 0, sizeof sh);
@@ -1074,7 +1206,11 @@ static bool TOBJ_T(handle_freeform)(TOBJ_T(tobj_builder) * b, const char *tok,
 
 static bool TOBJ_T(dispatch_line)(TOBJ_T(tobj_builder) * b, const char *p,
                                   size_t len) {
-  if (len > b->caps.line_bytes) return TOBJ_T(b_fail)(b, TOBJ_ERR_LIMIT_EXCEEDED);
+  if (len > b->caps.line_bytes) {
+    return TOBJ_T(b_error)(
+        b, TOBJ_ERR_LIMIT_EXCEEDED,
+        "tinyobjc: line length exceeds configured limit\n");
+  }
   tobj_cursor c;
   tobj_cur_init(&c, p, len);
   const char *tok;
@@ -1201,6 +1337,9 @@ static void TOBJ_T(builder_init)(TOBJ_T(tobj_builder) * b) {
   tobj_vec_init(&b->l_idx, sizeof(tobj_index));
   tobj_vec_init(&b->l_cnt, sizeof(int));
   tobj_vec_init(&b->p_idx, sizeof(tobj_index));
+  tobj_vec_init(&b->oob_v, sizeof(tobj_index_use));
+  tobj_vec_init(&b->oob_vt, sizeof(tobj_index_use));
+  tobj_vec_init(&b->oob_vn, sizeof(tobj_index_use));
   tobj_vec_init(&b->corners, sizeof(tobj_index));
   tobj_vec_init(&b->ringpos, sizeof(TOBJ_REAL));
   tobj_vec_init(&b->tris, sizeof(uint32_t));
@@ -1240,6 +1379,9 @@ static void TOBJ_T(builder_dispose)(TOBJ_T(tobj_builder) * b) {
   tobj_vec_free(&b->l_idx, a);
   tobj_vec_free(&b->l_cnt, a);
   tobj_vec_free(&b->p_idx, a);
+  tobj_vec_free(&b->oob_v, a);
+  tobj_vec_free(&b->oob_vt, a);
+  tobj_vec_free(&b->oob_vn, a);
   tobj_vec_free(&b->corners, a);
   tobj_vec_free(&b->ringpos, a);
   tobj_vec_free(&b->tris, a);
@@ -1305,6 +1447,8 @@ typedef struct TOBJ_T(tobj_tls) {
   bool store_colors;
   bool parse_vp;
   bool oom;
+  tobj_result err;
+  size_t err_line;
   tobj_vec lv, lvw, lvw_has, lcol, lcol_has, lvn, lvt, lvtw, lvtw_has, lvp;
   int vp_comps;
 } TOBJ_T(tobj_tls);
@@ -1331,7 +1475,11 @@ static void TOBJ_T(mt_worker)(void *arg) {
         }
         nums[n++] = d;
       }
-      while (n < 3) nums[n++] = 0.0;
+      if (n < 3) {
+        w->err = TOBJ_ERR_PARSE;
+        w->err_line = i + 1;
+        return;
+      }
       TOBJ_REAL xyz[3] = {(TOBJ_REAL)nums[0], (TOBJ_REAL)nums[1],
                           (TOBJ_REAL)nums[2]};
       uint8_t wh = (n == 4);
@@ -1356,8 +1504,14 @@ static void TOBJ_T(mt_worker)(void *arg) {
     } else if (tobj_slice_eq(tok, tl, "vn")) {
       TOBJ_REAL xyz[3] = {0, 0, 0};
       double d;
-      for (int k = 0; k < 3; k++)
-        if (tobj_scan_double(&c.p, c.end, &d)) xyz[k] = (TOBJ_REAL)d;
+      for (int k = 0; k < 3; k++) {
+        if (!tobj_scan_double(&c.p, c.end, &d)) {
+          w->err = TOBJ_ERR_PARSE;
+          w->err_line = i + 1;
+          return;
+        }
+        xyz[k] = (TOBJ_REAL)d;
+      }
       if (!tobj_vec_append(&w->lvn, xyz, 3, a)) {
         w->oom = true;
         return;
@@ -1369,6 +1523,11 @@ static void TOBJ_T(mt_worker)(void *arg) {
       for (; n < 2; n++) {
         if (!tobj_scan_double(&c.p, c.end, &d)) break;
         uv[n] = (TOBJ_REAL)d;
+      }
+      if (n < 1) {
+        w->err = TOBJ_ERR_PARSE;
+        w->err_line = i + 1;
+        return;
       }
       uint8_t wh = (uint8_t)tobj_scan_double(&c.p, c.end, &d);
       TOBJ_REAL wv = wh ? (TOBJ_REAL)d : (TOBJ_REAL)0;
@@ -1471,6 +1630,33 @@ static bool TOBJ_T(mt_prepass)(TOBJ_T(tobj_builder) * b, const tobj_vec *lines,
   bool ok = true;
   for (int t = 0; t < T; t++)
     if (tls[t].oom) ok = false;
+
+  size_t parse_error_line = 0;
+  for (int t = 0; t < T; t++) {
+    if (tls[t].err != TOBJ_OK &&
+        (parse_error_line == 0 || tls[t].err_line < parse_error_line)) {
+      parse_error_line = tls[t].err_line;
+    }
+  }
+  if (parse_error_line != 0 && ok) {
+    for (int t = 0; t < T; t++) {
+      tobj_vec_free(&tls[t].lv, a);
+      tobj_vec_free(&tls[t].lvw, a);
+      tobj_vec_free(&tls[t].lvw_has, a);
+      tobj_vec_free(&tls[t].lcol, a);
+      tobj_vec_free(&tls[t].lcol_has, a);
+      tobj_vec_free(&tls[t].lvn, a);
+      tobj_vec_free(&tls[t].lvt, a);
+      tobj_vec_free(&tls[t].lvtw, a);
+      tobj_vec_free(&tls[t].lvtw_has, a);
+      tobj_vec_free(&tls[t].lvp, a);
+    }
+    tobj_free(a, tls, (size_t)T * sizeof(*tls));
+    tobj_free(a, thunks, (size_t)T * sizeof(*thunks));
+    b->line = parse_error_line;
+    return TOBJ_T(b_error)(b, TOBJ_ERR_PARSE,
+                           "tinyobjc: malformed vertex record\n");
+  }
 
   /* merge plain arrays in thread (= file) order */
   for (int t = 0; ok && t < T; t++) {
@@ -1577,6 +1763,7 @@ tobj_result TOBJ_T(tobj_load_obj_from_memory)(TOBJ_T(tobj_scene) * out,
     TOBJ_T(dispatch_line)(&b, base + ln->pos, ln->len);
   }
 
+  if (b.err == TOBJ_OK) TOBJ_T(validate_index_uses)(&b);
   if (b.err == TOBJ_OK) TOBJ_T(finalize_shape)(&b);
 
   /* vertex color fallback: fill white if requested and none present */
@@ -1846,7 +2033,9 @@ tobj_result TOBJ_T(tobj_load_obj_with_callbacks)(
     tobj_line *ln = (tobj_line *)tobj_vec_at(&lines, i);
     b.line = i + 1;
     if (ln->len > b.caps.line_bytes) {
-      b.err = TOBJ_ERR_LIMIT_EXCEEDED;
+      TOBJ_T(b_error)(
+          &b, TOBJ_ERR_LIMIT_EXCEEDED,
+          "tinyobjc: line length exceeds configured limit\n");
       break;
     }
     tobj_cursor c;
@@ -1868,7 +2057,12 @@ tobj_result TOBJ_T(tobj_load_obj_with_callbacks)(
         }
         nums[n++] = d;
       }
-      while (n < 3) nums[n++] = 0.0;
+      if (n < 3) {
+        TOBJ_T(b_error)(
+            &b, TOBJ_ERR_PARSE,
+            "tinyobjc: 'v' record requires at least 3 components\n");
+        break;
+      }
       TOBJ_REAL w = (n == 4) ? (TOBJ_REAL)nums[3] : (TOBJ_REAL)1;
       if (cb->vertex_cb)
         cb->vertex_cb(ud, (TOBJ_REAL)nums[0], (TOBJ_REAL)nums[1],
@@ -1885,15 +2079,32 @@ tobj_result TOBJ_T(tobj_load_obj_with_callbacks)(
     } else if (tobj_slice_eq(tok, tl, "vn")) {
       double d;
       TOBJ_REAL xyz[3] = {0, 0, 0};
-      for (int k = 0; k < 3; k++)
-        if (tobj_scan_double(&c.p, c.end, &d)) xyz[k] = (TOBJ_REAL)d;
+      for (int k = 0; k < 3; k++) {
+        if (!tobj_scan_double(&c.p, c.end, &d)) {
+          TOBJ_T(b_error)(
+              &b, TOBJ_ERR_PARSE,
+              "tinyobjc: 'vn' record requires 3 components\n");
+          break;
+        }
+        xyz[k] = (TOBJ_REAL)d;
+      }
+      if (b.err != TOBJ_OK) break;
       if (cb->normal_cb) cb->normal_cb(ud, xyz[0], xyz[1], xyz[2]);
       numvn++;
     } else if (tobj_slice_eq(tok, tl, "vt")) {
       double d;
       TOBJ_REAL uvw[3] = {0, 0, 0};
-      for (int k = 0; k < 3; k++)
-        if (tobj_scan_double(&c.p, c.end, &d)) uvw[k] = (TOBJ_REAL)d;
+      int n = 0;
+      for (; n < 3; n++) {
+        if (!tobj_scan_double(&c.p, c.end, &d)) break;
+        uvw[n] = (TOBJ_REAL)d;
+      }
+      if (n < 1) {
+        TOBJ_T(b_error)(
+            &b, TOBJ_ERR_PARSE,
+            "tinyobjc: 'vt' record requires at least 1 component\n");
+        break;
+      }
       if (cb->texcoord_cb) cb->texcoord_cb(ud, uvw[0], uvw[1], uvw[2]);
       numvt++;
     } else if (tobj_slice_eq(tok, tl, "f") || tobj_slice_eq(tok, tl, "l") ||
@@ -1903,15 +2114,37 @@ tobj_result TOBJ_T(tobj_load_obj_with_callbacks)(
       const char *t2;
       size_t l2;
       while (tobj_next_token(&c, &t2, &l2)) {
+        if (t2[0] == '#') break;
+        if (b.corners.count >= b.caps.arity) {
+          TOBJ_T(b_error)(
+              &b, TOBJ_ERR_LIMIT_EXCEEDED,
+              "tinyobjc: primitive vertex count exceeds configured limit\n");
+          break;
+        }
         tobj_index *slot = (tobj_index *)tobj_vec_push(&b.corners, &alloc);
         if (!slot) {
           b.err = TOBJ_ERR_ALLOC;
           break;
         }
-        TOBJ_T(parse_corner_n)(t2, l2, numv, numvt, numvn, slot);
+        if (!TOBJ_T(parse_corner_n)(t2, l2, numv, numvt, numvn, slot)) {
+          TOBJ_T(b_error)(
+              &b, TOBJ_ERR_PARSE,
+              "tinyobjc: invalid or out-of-range vertex index\n");
+          break;
+        }
+        if (!TOBJ_T(record_index_use)(&b, &b.oob_v, slot->vertex_index,
+                                      (size_t)numv)) {
+          break;
+        }
       }
       if (b.err != TOBJ_OK) break;
       int nidx = tobj_size_to_int(b.corners.count);
+      if ((kind == 'f' && nidx < 3) || (kind == 'l' && nidx < 2) ||
+          (kind == 'p' && nidx < 1)) {
+        TOBJ_T(b_error)(&b, TOBJ_ERR_PARSE,
+                        "tinyobjc: primitive has too few vertices\n");
+        break;
+      }
       const tobj_index *ci = (const tobj_index *)b.corners.data;
       if (kind == 'f' && cb->index_cb && nidx >= 3)
         cb->index_cb(ud, ci, nidx);
@@ -1971,6 +2204,7 @@ tobj_result TOBJ_T(tobj_load_obj_with_callbacks)(
     }
   }
 
+  if (b.err == TOBJ_OK) TOBJ_T(validate_index_uses)(&b);
   TOBJ_T(builder_dispose)(&b);
   tobj_vec_free(&lines, &alloc);
   tobj_arena_destroy(arena);

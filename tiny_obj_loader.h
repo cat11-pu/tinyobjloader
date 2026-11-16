@@ -6394,6 +6394,25 @@ static inline int size_to_int(size_t sz) {
   return sz > static_cast<size_t>(INT_MAX) ? INT_MAX : static_cast<int>(sz);
 }
 
+// Hard limit for a single face.  This keeps malformed inputs from turning a
+// tiny file into an unbounded allocation (and from overflowing 32-bit face
+// counters in the optimized parser).
+static const size_t TINYOBJ_MAX_FACE_VERTICES = size_t(65535);
+
+// Return the first source line containing an index that is outside
+// [0, count).  Returns 0 when every recorded use is valid.
+static inline size_t firstOutOfBoundsLine(
+    const std::vector<std::pair<int, size_t> > &uses, int count) {
+  size_t first_line = 0;
+  for (size_t i = 0; i < uses.size(); i++) {
+    if (uses[i].first >= count &&
+        (first_line == 0 || uses[i].second < first_line)) {
+      first_line = uses[i].second;
+    }
+  }
+  return first_line;
+}
+
 // Make index zero-base, and also support relative index.
 static inline bool fixIndex(int idx, int n, int *ret, bool allow_zero,
                             const warning_context &context) {
@@ -7230,6 +7249,117 @@ static inline bool sr_parseReal(StreamReader &sr, real_t *out,
   return true;
 }
 
+// Parse a required real token.  Unlike sr_parseReal above (which treats a
+// missing token as an optional component), this rejects truncated records.
+static inline bool sr_parseRealRequired(StreamReader &sr, real_t *out,
+                                        std::string *err,
+                                        const std::string &filename,
+                                        const char *what) {
+  sr.skip_space();
+  if (sr.eof() || sr.at_line_end() || sr.peek() == '#') {
+    if (err) {
+      (*err) += sr.format_error(
+          filename, std::string("expected number for ") + what);
+    }
+    *out = static_cast<real_t>(0.0);
+    return false;
+  }
+  return sr_parseReal(sr, out, 0.0, err, filename);
+}
+
+// Parse an optional real token.  Returns false when the token is absent;
+// malformed tokens are reported as errors and also return false.
+static inline bool sr_parseRealOptional(StreamReader &sr, real_t *out,
+                                        std::string *err,
+                                        const std::string &filename,
+                                        const char *what) {
+  sr.skip_space();
+  if (sr.eof() || sr.at_line_end() || sr.peek() == '#') {
+    return false;
+  }
+  return sr_parseRealRequired(sr, out, err, filename, what);
+}
+
+// Parse an integer token without accepting a truncated or overflowing token.
+// The token must consist of an optional sign followed by one or more digits.
+static inline bool sr_parseIntStrict(StreamReader &sr, int *out,
+                                     std::string *err,
+                                     const std::string &filename,
+                                     const char *what) {
+  sr.skip_space();
+  if (sr.eof() || sr.at_line_end() || sr.peek() == '#') {
+    if (err) {
+      (*err) += sr.format_error(
+          filename, std::string("expected integer for ") + what);
+    }
+    return false;
+  }
+
+  const char *start = sr.current_ptr();
+  size_t rem = sr.remaining();
+  size_t len = 0;
+  while (len < rem) {
+    char c = start[len];
+    if (c == '/' || c == ' ' || c == '\t' || c == '\r' || c == '\n' ||
+        c == '\0') {
+      break;
+    }
+    len++;
+  }
+  if (len == 0 || len >= 64) {
+    if (err) {
+      (*err) += sr.format_error(
+          filename, std::string("invalid integer for ") + what);
+    }
+    sr.advance(len);
+    return false;
+  }
+
+  char tmp[64];
+  memcpy(tmp, start, len);
+  tmp[len] = '\0';
+
+  size_t pos = 0;
+  if (tmp[pos] == '+' || tmp[pos] == '-') pos++;
+  if (pos == len) {
+    if (err) {
+      (*err) += sr.format_error(
+          filename, std::string("invalid integer for ") + what);
+    }
+    sr.advance(len);
+    return false;
+  }
+  for (size_t i = pos; i < len; i++) {
+    if (tmp[i] < '0' || tmp[i] > '9') {
+      if (err) {
+        (*err) += sr.format_error(
+            filename, std::string("invalid integer for ") + what);
+      }
+      sr.advance(len);
+      return false;
+    }
+  }
+
+  errno = 0;
+  char *endptr = NULL;
+  long val = strtol(tmp, &endptr, 10);
+  if (errno == ERANGE || endptr != tmp + len ||
+      val > (std::numeric_limits<int>::max)() ||
+      val < (std::numeric_limits<int>::min)()) {
+    if (err) {
+      (*err) += sr.format_error(
+          filename,
+          std::string("integer out of range for ") + what + " '" + tmp + "'");
+    }
+    sr.advance(len);
+    return false;
+  }
+
+  *out = static_cast<int>(val);
+  sr.advance(len);
+  return true;
+}
+
 static inline bool sr_parseReal2(real_t *x, real_t *y, StreamReader &sr,
                                   std::string *err,
                                   const std::string &filename,
@@ -7262,26 +7392,43 @@ static inline int sr_parseVertexWithColor(real_t *x, real_t *y, real_t *z,
                                           const double default_x = 0.0,
                                           const double default_y = 0.0,
                                           const double default_z = 0.0) {
-  if (!sr_parseReal(sr, x, default_x, err, filename)) return -1;
-  if (!sr_parseReal(sr, y, default_y, err, filename)) return -1;
-  if (!sr_parseReal(sr, z, default_z, err, filename)) return -1;
+  if (!sr_parseRealRequired(sr, x, err, filename, "vertex x")) return -1;
+  if (!sr_parseRealRequired(sr, y, err, filename, "vertex y")) return -1;
+  if (!sr_parseRealRequired(sr, z, err, filename, "vertex z")) return -1;
 
-  bool has_r = sr_parseReal(sr, r);
+  sr.skip_space();
+  bool has_r = !sr.eof() && !sr.at_line_end() && sr.peek() != '#';
+  if (has_r && !sr_parseRealRequired(sr, r, err, filename,
+                                     "vertex weight/red")) {
+    return -1;
+  }
   if (!has_r) {
     (*r) = (*g) = (*b) = 1.0;
     return 3;
   }
 
-  bool has_g = sr_parseReal(sr, g);
+  sr.skip_space();
+  bool has_g = !sr.eof() && !sr.at_line_end() && sr.peek() != '#';
+  if (has_g && !sr_parseRealRequired(sr, g, err, filename, "vertex green")) {
+    return -1;
+  }
   if (!has_g) {
     (*g) = (*b) = 1.0;
     return 4;
   }
 
-  bool has_b = sr_parseReal(sr, b);
+  sr.skip_space();
+  bool has_b = !sr.eof() && !sr.at_line_end() && sr.peek() != '#';
+  if (has_b && !sr_parseRealRequired(sr, b, err, filename, "vertex blue")) {
+    return -1;
+  }
   if (!has_b) {
-    (*r) = (*g) = (*b) = 1.0;
-    return 3;
+    if (err) {
+      (*err) += sr.format_error(
+          filename,
+          "malformed vertex record: expected 3, 4, or 6 components");
+    }
+    return -1;
   }
 
   return 6;
@@ -7362,7 +7509,10 @@ static bool sr_parseTriple(StreamReader &sr, int vsize, int vnsize, int vtsize,
   vertex_index_t vi(-1);
 
   sr.skip_space();
-  if (!fixIndex(sr_parseIntNoSkip(sr), vsize, &vi.v_idx, false, context)) {
+  int raw_index = 0;
+  if (!sr_parseIntStrict(sr, &raw_index, context.warn, context.filename,
+                         "vertex index") ||
+      !fixIndex(raw_index, vsize, &vi.v_idx, false, context)) {
     return false;
   }
 
@@ -7373,10 +7523,16 @@ static bool sr_parseTriple(StreamReader &sr, int vsize, int vnsize, int vtsize,
   }
   sr.advance(1);
 
+  if (sr.eof() || sr.at_line_end()) {
+    return false;
+  }
+
   // i//k
-  if (!sr.eof() && sr.peek() == '/') {
+  if (sr.peek() == '/') {
     sr.advance(1);
-    if (!fixIndex(sr_parseIntNoSkip(sr), vnsize, &vi.vn_idx, true, context)) {
+    if (!sr_parseIntStrict(sr, &raw_index, context.warn, context.filename,
+                           "normal index") ||
+        !fixIndex(raw_index, vnsize, &vi.vn_idx, true, context)) {
       return false;
     }
     sr_skipUntil(sr, "/ \t\r\n");
@@ -7385,7 +7541,9 @@ static bool sr_parseTriple(StreamReader &sr, int vsize, int vnsize, int vtsize,
   }
 
   // i/j/k or i/j
-  if (!fixIndex(sr_parseIntNoSkip(sr), vtsize, &vi.vt_idx, true, context)) {
+  if (!sr_parseIntStrict(sr, &raw_index, context.warn, context.filename,
+                         "texcoord index") ||
+      !fixIndex(raw_index, vtsize, &vi.vt_idx, true, context)) {
     return false;
   }
 
@@ -7397,7 +7555,9 @@ static bool sr_parseTriple(StreamReader &sr, int vsize, int vnsize, int vtsize,
 
   // i/j/k
   sr.advance(1);
-  if (!fixIndex(sr_parseIntNoSkip(sr), vnsize, &vi.vn_idx, true, context)) {
+  if (!sr_parseIntStrict(sr, &raw_index, context.warn, context.filename,
+                         "normal index") ||
+      !fixIndex(raw_index, vnsize, &vi.vn_idx, true, context)) {
     return false;
   }
   sr_skipUntil(sr, "/ \t\r\n");
@@ -8873,9 +9033,9 @@ static bool LoadObjInternal(attrib_t *attrib, std::vector<shape_t> *shapes,
 
   unsigned int current_smoothing_id = 0;
 
-  int greatest_v_idx = -1;
-  int greatest_vn_idx = -1;
-  int greatest_vt_idx = -1;
+  std::vector<std::pair<int, size_t> > v_index_uses;
+  std::vector<std::pair<int, size_t> > vn_index_uses;
+  std::vector<std::pair<int, size_t> > vt_index_uses;
 
   shape_t shape;
 
@@ -8899,6 +9059,26 @@ static bool LoadObjInternal(attrib_t *attrib, std::vector<shape_t> *shapes,
     if (sr.peek() == '#') { sr.skip_line(); continue; }
 
     size_t line_num = sr.line_num();
+
+    // Reject bare records such as "v", "vn", "f" with no payload.  These
+    // would otherwise fall through the "unknown directive" path unnoticed.
+    if ((sr.peek() == 'v' &&
+         (sr.peek_at(1) == '\0' || sr.char_at(1, '\n') ||
+          sr.char_at(1, '\r'))) ||
+        (sr.peek() == 'v' && sr.peek_at(1) == 'n' &&
+         (sr.peek_at(2) == '\0' || sr.char_at(2, '\n') ||
+          sr.char_at(2, '\r'))) ||
+        (sr.peek() == 'v' && sr.peek_at(1) == 't' &&
+         (sr.peek_at(2) == '\0' || sr.char_at(2, '\n') ||
+          sr.char_at(2, '\r'))) ||
+        ((sr.peek() == 'f' || sr.peek() == 'l' || sr.peek() == 'p') &&
+         (sr.peek_at(1) == '\0' || sr.char_at(1, '\n') ||
+          sr.char_at(1, '\r')))) {
+      if (err) {
+        (*err) += sr.format_error(filename, "record has no data");
+      }
+      return false;
+    }
 
     // vertex
     if (sr.peek() == 'v' && (sr.peek_at(1) == ' ' || sr.peek_at(1) == '\t')) {
@@ -8930,7 +9110,9 @@ static bool LoadObjInternal(attrib_t *attrib, std::vector<shape_t> *shapes,
     if (sr.peek() == 'v' && sr.peek_at(1) == 'n' && (sr.peek_at(2) == ' ' || sr.peek_at(2) == '\t')) {
       sr.advance(3);
       real_t x, y, z;
-      if (!sr_parseReal3(&x, &y, &z, sr, err, filename)) return false;
+      if (!sr_parseRealRequired(sr, &x, err, filename, "normal x")) return false;
+      if (!sr_parseRealRequired(sr, &y, err, filename, "normal y")) return false;
+      if (!sr_parseRealRequired(sr, &z, err, filename, "normal z")) return false;
       vn.push_back(x);
       vn.push_back(y);
       vn.push_back(z);
@@ -8942,13 +9124,23 @@ static bool LoadObjInternal(attrib_t *attrib, std::vector<shape_t> *shapes,
     if (sr.peek() == 'v' && sr.peek_at(1) == 't' && (sr.peek_at(2) == ' ' || sr.peek_at(2) == '\t')) {
       sr.advance(3);
       real_t x, y;
-      if (!sr_parseReal2(&x, &y, sr, err, filename)) return false;
+      if (!sr_parseRealRequired(sr, &x, err, filename, "texcoord u")) return false;
+      sr.skip_space();
+      if (sr.eof() || sr.at_line_end() || sr.peek() == '#') {
+        y = static_cast<real_t>(0.0);
+      } else if (!sr_parseRealRequired(sr, &y, err, filename, "texcoord v")) {
+        return false;
+      }
       vt.push_back(x);
       vt.push_back(y);
 
       // Parse optional w component
       real_t w = static_cast<real_t>(0.0);
-      sr_parseReal(sr, &w);
+      sr.skip_space();
+      if (!sr.eof() && !sr.at_line_end() && sr.peek() != '#' &&
+          !sr_parseRealRequired(sr, &w, err, filename, "texcoord w")) {
+        return false;
+      }
       vt_w.push_back(w);
 
       sr.skip_line();
@@ -9026,8 +9218,22 @@ static bool LoadObjInternal(attrib_t *attrib, std::vector<shape_t> *shapes,
         }
 
         line.vertex_indices.push_back(vi);
+        if (vi.v_idx >= size_to_int(v.size() / 3))
+          v_index_uses.push_back(std::make_pair(vi.v_idx, line_num));
+        if (vi.vn_idx >= size_to_int(vn.size() / 3))
+          vn_index_uses.push_back(std::make_pair(vi.vn_idx, line_num));
+        if (vi.vt_idx >= size_to_int(vt.size() / 2))
+          vt_index_uses.push_back(std::make_pair(vi.vt_idx, line_num));
         sr.skip_space_and_cr();
         l_loop_iter++;
+      }
+
+      if (line.vertex_indices.size() < 2) {
+        if (err) {
+          (*err) += sr.format_error(filename,
+              "failed to parse `l' line (requires at least 2 vertices)");
+        }
+        return false;
       }
 
       prim_group.lineGroup.push_back(line);
@@ -9057,8 +9263,22 @@ static bool LoadObjInternal(attrib_t *attrib, std::vector<shape_t> *shapes,
         }
 
         pts.vertex_indices.push_back(vi);
+        if (vi.v_idx >= size_to_int(v.size() / 3))
+          v_index_uses.push_back(std::make_pair(vi.v_idx, line_num));
+        if (vi.vn_idx >= size_to_int(vn.size() / 3))
+          vn_index_uses.push_back(std::make_pair(vi.vn_idx, line_num));
+        if (vi.vt_idx >= size_to_int(vt.size() / 2))
+          vt_index_uses.push_back(std::make_pair(vi.vt_idx, line_num));
         sr.skip_space_and_cr();
         p_loop_iter++;
+      }
+
+      if (pts.vertex_indices.empty()) {
+        if (err) {
+          (*err) += sr.format_error(filename,
+              "failed to parse `p' line (requires at least 1 vertex)");
+        }
+        return false;
       }
 
       prim_group.pointsGroup.push_back(pts);
@@ -9080,6 +9300,14 @@ static bool LoadObjInternal(attrib_t *attrib, std::vector<shape_t> *shapes,
       size_t f_loop_iter = 0;
       while (!sr.at_line_end() && sr.peek() != '#' &&
              f_loop_iter < f_loop_max) {
+        if (face.vertex_indices.size() >= TINYOBJ_MAX_FACE_VERTICES) {
+          if (err) {
+            (*err) += sr.format_error(filename,
+                "`f' line exceeds maximum face vertex count");
+          }
+          return false;
+        }
+
         vertex_index_t vi;
         if (!sr_parseTriple(sr, size_to_int(v.size() / 3),
                          size_to_int(vn.size() / 3),
@@ -9091,15 +9319,24 @@ static bool LoadObjInternal(attrib_t *attrib, std::vector<shape_t> *shapes,
           return false;
         }
 
-        greatest_v_idx = greatest_v_idx > vi.v_idx ? greatest_v_idx : vi.v_idx;
-        greatest_vn_idx =
-            greatest_vn_idx > vi.vn_idx ? greatest_vn_idx : vi.vn_idx;
-        greatest_vt_idx =
-            greatest_vt_idx > vi.vt_idx ? greatest_vt_idx : vi.vt_idx;
+        if (vi.v_idx >= size_to_int(v.size() / 3))
+          v_index_uses.push_back(std::make_pair(vi.v_idx, line_num));
+        if (vi.vn_idx >= size_to_int(vn.size() / 3))
+          vn_index_uses.push_back(std::make_pair(vi.vn_idx, line_num));
+        if (vi.vt_idx >= size_to_int(vt.size() / 2))
+          vt_index_uses.push_back(std::make_pair(vi.vt_idx, line_num));
 
         face.vertex_indices.push_back(vi);
         sr.skip_space_and_cr();
         f_loop_iter++;
+      }
+
+      if (face.vertex_indices.size() < 3) {
+        if (err) {
+          (*err) += sr.format_error(filename,
+              "failed to parse `f' line (requires at least 3 vertices)");
+        }
+        return false;
       }
 
       prim_group.faceGroup.push_back(face);
@@ -9363,28 +9600,33 @@ static bool LoadObjInternal(attrib_t *attrib, std::vector<shape_t> *shapes,
     vc.clear();
   }
 
-  if (greatest_v_idx >= size_to_int(v.size() / 3)) {
-    if (warn) {
+  const size_t invalid_v_line =
+      firstOutOfBoundsLine(v_index_uses, size_to_int(v.size() / 3));
+  const size_t invalid_vn_line =
+      firstOutOfBoundsLine(vn_index_uses, size_to_int(vn.size() / 3));
+  const size_t invalid_vt_line =
+      firstOutOfBoundsLine(vt_index_uses, size_to_int(vt.size() / 2));
+  if (invalid_v_line) {
+    if (err) {
       std::stringstream ss;
-      ss << "Vertex indices out of bounds (line " << sr.line_num() << ".)\n\n";
-      (*warn) += ss.str();
+      ss << filename << ":" << invalid_v_line
+         << ": error: vertex index out of bounds\n";
+      (*err) += ss.str();
     }
+    shapes->clear();
+    return false;
   }
-  if (greatest_vn_idx >= size_to_int(vn.size() / 3)) {
-    if (warn) {
-      std::stringstream ss;
-      ss << "Vertex normal indices out of bounds (line " << sr.line_num()
-         << ".)\n\n";
-      (*warn) += ss.str();
-    }
+  if (invalid_vn_line && warn) {
+    std::stringstream ss;
+    ss << "Vertex normal indices out of bounds (line " << invalid_vn_line
+       << ".)\n\n";
+    (*warn) += ss.str();
   }
-  if (greatest_vt_idx >= size_to_int(vt.size() / 2)) {
-    if (warn) {
-      std::stringstream ss;
-      ss << "Vertex texcoord indices out of bounds (line " << sr.line_num()
-         << ".)\n\n";
-      (*warn) += ss.str();
-    }
+  if (invalid_vt_line && warn) {
+    std::stringstream ss;
+    ss << "Vertex texcoord indices out of bounds (line " << invalid_vt_line
+       << ".)\n\n";
+    (*warn) += ss.str();
   }
 
   bool ret = exportGroupsToShape(&shape, prim_group, tags, material, name,
@@ -9521,6 +9763,16 @@ static bool LoadObjWithCallbackInternal(StreamReader &sr,
   std::vector<std::string> names;
   names.reserve(2);
   std::vector<const char *> names_out;
+  int num_vertices = 0;
+  int num_normals = 0;
+  int num_texcoords = 0;
+  std::vector<std::pair<int, size_t> > v_index_uses;
+  std::vector<std::pair<int, size_t> > vn_index_uses;
+  std::vector<std::pair<int, size_t> > vt_index_uses;
+
+  warning_context context;
+  context.warn = warn;
+  context.filename = "";
 
   // Handle BOM
   if (sr.remaining() >= 3 &&
@@ -9552,6 +9804,7 @@ static bool LoadObjWithCallbackInternal(StreamReader &sr,
         bool found_color = (num_components == 6);
         callback.vertex_color_cb(user_data, x, y, z, r, g, b, found_color);
       }
+      num_vertices++;
       sr.skip_line();
       continue;
     }
@@ -9560,10 +9813,13 @@ static bool LoadObjWithCallbackInternal(StreamReader &sr,
     if (sr.peek() == 'v' && sr.peek_at(1) == 'n' && (sr.peek_at(2) == ' ' || sr.peek_at(2) == '\t')) {
       sr.advance(3);
       real_t x, y, z;
-      sr_parseReal3(&x, &y, &z, sr);
+      if (!sr_parseRealRequired(sr, &x, err, "", "normal x")) return false;
+      if (!sr_parseRealRequired(sr, &y, err, "", "normal y")) return false;
+      if (!sr_parseRealRequired(sr, &z, err, "", "normal z")) return false;
       if (callback.normal_cb) {
         callback.normal_cb(user_data, x, y, z);
       }
+      num_normals++;
       sr.skip_line();
       continue;
     }
@@ -9572,10 +9828,24 @@ static bool LoadObjWithCallbackInternal(StreamReader &sr,
     if (sr.peek() == 'v' && sr.peek_at(1) == 't' && (sr.peek_at(2) == ' ' || sr.peek_at(2) == '\t')) {
       sr.advance(3);
       real_t x, y, z;
-      sr_parseReal3(&x, &y, &z, sr);
+      if (!sr_parseRealRequired(sr, &x, err, "", "texcoord u")) return false;
+      sr.skip_space();
+      if (sr.eof() || sr.at_line_end() || sr.peek() == '#') {
+        y = z = static_cast<real_t>(0.0);
+      } else {
+        if (!sr_parseRealRequired(sr, &y, err, "", "texcoord v"))
+          return false;
+        sr.skip_space();
+        if (sr.eof() || sr.at_line_end() || sr.peek() == '#') {
+          z = static_cast<real_t>(0.0);
+        } else if (!sr_parseRealRequired(sr, &z, err, "", "texcoord w")) {
+          return false;
+        }
+      }
       if (callback.texcoord_cb) {
         callback.texcoord_cb(user_data, x, y, z);
       }
+      num_texcoords++;
       sr.skip_line();
       continue;
     }
@@ -9590,7 +9860,33 @@ static bool LoadObjWithCallbackInternal(StreamReader &sr,
       size_t cf_loop_iter = 0;
       while (!sr.at_line_end() && sr.peek() != '#' &&
              cf_loop_iter < cf_loop_max) {
-        vertex_index_t vi = sr_parseRawTriple(sr);
+        if (indices.size() >= TINYOBJ_MAX_FACE_VERTICES) {
+          if (err) {
+            (*err) += sr.format_error(
+                "", "`f' line exceeds maximum face vertex count");
+          }
+          return false;
+        }
+
+        context.line_number = sr.line_num();
+        vertex_index_t vi;
+        if (!sr_parseTriple(sr, num_vertices, num_normals, num_texcoords,
+                            &vi, context)) {
+          if (err) {
+            (*err) += sr.format_error(
+                "", "failed to parse `f' line (invalid vertex index)");
+          }
+          return false;
+        }
+        if (vi.v_idx >= num_vertices)
+          v_index_uses.push_back(
+              std::make_pair(vi.v_idx, sr.line_num()));
+        if (vi.vn_idx >= num_normals)
+          vn_index_uses.push_back(
+              std::make_pair(vi.vn_idx, sr.line_num()));
+        if (vi.vt_idx >= num_texcoords)
+          vt_index_uses.push_back(
+              std::make_pair(vi.vt_idx, sr.line_num()));
 
         index_t idx;
         idx.vertex_index = vi.v_idx;
@@ -9600,6 +9896,14 @@ static bool LoadObjWithCallbackInternal(StreamReader &sr,
         indices.push_back(idx);
         sr.skip_space_and_cr();
         cf_loop_iter++;
+      }
+
+      if (indices.size() < 3) {
+        if (err) {
+          (*err) += sr.format_error(
+              "", "failed to parse `f' line (requires at least 3 vertices)");
+        }
+        return false;
       }
 
       if (callback.index_cb && indices.size() > 0) {
@@ -9781,6 +10085,24 @@ static bool LoadObjWithCallbackInternal(StreamReader &sr,
     // Ignore unknown command.
     sr.skip_line();
   }
+
+  const size_t invalid_v_line =
+      firstOutOfBoundsLine(v_index_uses, num_vertices);
+  const size_t invalid_vn_line =
+      firstOutOfBoundsLine(vn_index_uses, num_normals);
+  const size_t invalid_vt_line =
+      firstOutOfBoundsLine(vt_index_uses, num_texcoords);
+  if (invalid_v_line) {
+    if (err) {
+      std::stringstream ss;
+      ss << ":" << invalid_v_line
+         << ": error: vertex index out of bounds\n";
+      (*err) += ss.str();
+    }
+    return false;
+  }
+  (void)invalid_vn_line;
+  (void)invalid_vt_line;
 
   return true;
 }
@@ -10895,6 +11217,18 @@ static bool opt_parseLine(OptCommand *command, const char *p, size_t p_len,
 
   if (TINYOBJ_OPT_IS_NEW_LINE(token[0]) || token[0] == '#') return false;
 
+  if ((token[0] == 'v' && TINYOBJ_OPT_IS_NEW_LINE(token[1])) ||
+      (token[0] == 'v' && token[1] == 'n' &&
+       TINYOBJ_OPT_IS_NEW_LINE(token[2])) ||
+      (token[0] == 'v' && token[1] == 't' &&
+       TINYOBJ_OPT_IS_NEW_LINE(token[2])) ||
+      ((token[0] == 'f' || token[0] == 'l' || token[0] == 'p') &&
+       TINYOBJ_OPT_IS_NEW_LINE(token[1]))) {
+    if (parse_error) *parse_error = true;
+    if (parse_error_message) *parse_error_message = "record has no data";
+    return false;
+  }
+
   // vertex
   if (token[0] == 'v' && TINYOBJ_OPT_IS_SPACE(token[1])) {
     token += 2;
@@ -11016,6 +11350,14 @@ static bool opt_parseLine(OptCommand *command, const char *p, size_t p_len,
     int face_count = 0;
 
     while (!TINYOBJ_OPT_IS_NEW_LINE(token[0]) && !opt_is_comment_start(token)) {
+      if (static_cast<size_t>(face_count) >= TINYOBJ_MAX_FACE_VERTICES) {
+        if (parse_error) *parse_error = true;
+        if (parse_error_message) {
+          *parse_error_message =
+              "`f' line exceeds maximum face vertex count";
+        }
+        return false;
+      }
       opt_index_t vi;
       if (!opt_parseRawTriple(&token, &vi)) {
         if (parse_error) *parse_error = true;
@@ -11040,14 +11382,13 @@ static bool opt_parseLine(OptCommand *command, const char *p, size_t p_len,
       command->type = OPT_CMD_F;
       command->face_vertex_count = static_cast<unsigned int>(face_count);
 
-    // Preserve degenerate faces so warnings and EOF shape behavior can match
-    // the legacy loader, but do not reserve output slots for them.
     if (face_count < 3) {
-      command->degenerate_face = true;
-      command->emitted_face_count = 0;
-      command->emitted_face_verts = 0;
-      command->f_count = 0;
-      return true;
+      if (parse_error) *parse_error = true;
+      if (parse_error_message) {
+        *parse_error_message =
+            "failed to parse `f' line (requires at least 3 vertices)";
+      }
+      return false;
     }
 
       if (triangulate) {
@@ -12492,6 +12833,13 @@ static bool LoadObjOpt_internal(basic_attrib_t<> *attrib,
               "failed to parse `f' line (invalid vertex index)";
           return;
         }
+        if (idx.vertex_index < 0 ||
+            static_cast<size_t>(idx.vertex_index) >= num_v) {
+          merge_error_lines[t] = face.source_line;
+          merge_error_messages[t] =
+              "failed to parse `f' line (vertex index out of bounds)";
+          return;
+        }
         opt_updateGreatestIndex(idx.vertex_index, &greatest_v_idx);
         if (vi.texcoord_index == opt_index_t::kNotPresent) {
           idx.texcoord_index = -1;
@@ -13506,6 +13854,13 @@ static bool LoadObjOptTyped_internal(OptResult *result,
               "failed to parse `f' line (invalid vertex index)";
           return;
         }
+        if (idx.vertex_index < 0 ||
+            static_cast<size_t>(idx.vertex_index) >= num_v) {
+          merge_error_lines[t] = face.source_line;
+          merge_error_messages[t] =
+              "failed to parse `f' line (vertex index out of bounds)";
+          return;
+        }
         opt_updateGreatestIndex(idx.vertex_index, &greatest_v_idx);
         if (vi.texcoord_index == opt_index_t::kNotPresent) {
           idx.texcoord_index = -1;
@@ -13608,6 +13963,19 @@ static bool LoadObjOptTyped_internal(OptResult *result,
   }
 
   if (first_merge_error_line != 0) {
+    attrib.vertices.clear();
+    attrib.vertex_weights.clear();
+    attrib.normals.clear();
+    attrib.texcoords.clear();
+    attrib.texcoord_ws.clear();
+    attrib.colors.clear();
+    attrib.indices.clear();
+    attrib.face_num_verts.clear();
+    attrib.material_ids.clear();
+    attrib.smoothing_group_ids.clear();
+    result->shapes.clear();
+    result->materials.clear();
+    result->valid = false;
     if (err) {
       (*err) += "Failed parse line(line " +
                 std::to_string(first_merge_error_line) + "). " +

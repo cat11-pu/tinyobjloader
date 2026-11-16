@@ -1216,9 +1216,10 @@ void test_invalid_face_definition() {
     std::cerr << "ERR: " << err << std::endl;
   }
 
-  TEST_CHECK(true == ret);
-  TEST_CHECK(1 == shapes.size());
-  TEST_CHECK(0 == shapes[0].mesh.indices.size());
+  TEST_CHECK(false == ret);
+  TEST_CHECK(err.find(":15:") != std::string::npos);
+  TEST_CHECK(err.find("at least 3 vertices") != std::string::npos);
+  TEST_CHECK(shapes.empty());
 }
 
 void test_Empty_mtl_basedir_issue177() {
@@ -2483,7 +2484,7 @@ void test_numeric_overflow_preserves_default() {
   // The hand-written fallback parser produces inf for large exponents instead.
   std::string obj_str =
       "v 1e9999 2.0 3.0\n"    // first coord overflows
-      "f 1\n";
+      "f 1 1 1\n";
 
   std::istringstream obj_stream(obj_str);
   tinyobj::attrib_t attrib;
@@ -2569,7 +2570,7 @@ void test_numeric_extreme_precision() {
          "2.99999999999999999999999999999999999999 "
          "0.00000000000000000000000000000000000001\n"
       "v 123456789012345678.0 -123456789012345678.0 0.0\n"
-      "f 1 2\n";
+      "f 1 2 1\n";
 
   std::istringstream obj_stream(obj_str);
   tinyobj::attrib_t attrib;
@@ -3320,10 +3321,10 @@ void test_out_of_range_face_index() {
   std::string warn, err;
   bool ret = tinyobj::LoadObj(&attrib, &shapes, &materials, &warn, &err,
                               &iss, NULL);
-  // Should parse without crashing. The face will have an out-of-range index
-  // which may produce a warning during triangulation.
-  TEST_CHECK(ret == true);
-  TEST_CHECK(attrib.vertices.size() == 9);
+  // Out-of-range vertex indices are malformed and must fail with a line.
+  TEST_CHECK(ret == false);
+  TEST_CHECK(err.find(":4:") != std::string::npos);
+  TEST_CHECK(err.find("out of bounds") != std::string::npos);
 }
 
 // Fuzzer test.
@@ -3700,9 +3701,10 @@ void test_loadobjopt_degenerate_face() {
 
   bool ret = tinyobj::LoadObjOpt(&attrib, &shapes, &materials, &warn, &err,
                                   obj_text, obj_len, config);
-  TEST_CHECK(ret == true);
-  TEST_CHECK(attrib.indices.size() == 3);   // only the valid triangle
-  TEST_CHECK(attrib.face_num_verts.size() == 1);  // 1 face
+  TEST_CHECK(ret == false);
+  TEST_CHECK(err.find("at least 3 vertices") != std::string::npos);
+  TEST_CHECK(attrib.indices.empty());
+  TEST_CHECK(attrib.face_num_verts.empty());
 }
 
 void test_loadobjopt_usemtl_multiple_faces() {
